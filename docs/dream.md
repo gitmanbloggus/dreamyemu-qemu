@@ -39,10 +39,15 @@ from `__log_buf` (VA `0xC02C9000` = PA `0x102C9000`, 128 KiB ring):
   registered, `Freeing init memory`, init parses the recovery init.rc and
   yaffs mounts `cache` (mtdblock4) from the image.
 - Open, in order:
-  1. **No fb0.** MDDI reports no client ("mddi_pmdh: no client found"),
-     so the panel driver never binds and msm_fb never registers. Next:
-     answer GET_CLIENT_CAP with reverse packets (client ID 0xD263 per
-     the Rust bring-up) so the trout panel binds.
+  1. **Recovery runs and draws.** MDDI answers GET_CLIENT_CAP with a
+     client capability packet (Mfr 0xD263, product 0, 320x480), the kernel
+     publishes `mddi_c_d263_0000`, `msmfb_probe() installing 320 x 480
+     panel`, and /sbin/recovery draws its error screen into the fb at
+     SMI 0x03800000 (both halves of the double buffer, read back with
+     `pmemsave 0x03800000 0x96000`). Still missing: the frame-start
+     signal (`msmfb_pan_display timeout waiting for frame start`), the
+     panel register read (`mddi_remote_read(150000) timeout` -> "unknown
+     panel id"), and showing the fb on QEMU's display.
   2. **Guest clock slow:** ~2.65 s of kernel time after 120 s of wall
      time, CPU mostly in the idle loop. The DGT model defaults to /4
      (HD2); check what the trout timer code assumes for the DGT rate.
