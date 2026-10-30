@@ -112,6 +112,8 @@ arm_common_ss.add(when: 'CONFIG_VEXPRESS', if_true: files('vexpress.c'))
 
 arm_common_ss.add(when: 'CONFIG_HTCLEO', if_true: files(
   'htcleo/htcleo.c',
+  'dream/dream.c',
+  'dream/msm_mddi.c',
   'htcleo/msm_vic.c',
   'htcleo/msm_csr.c',
   'htcleo/msm_gpio.c',

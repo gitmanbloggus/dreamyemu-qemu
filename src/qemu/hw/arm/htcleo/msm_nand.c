@@ -68,8 +68,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmNandState, MSM_NAND)
 #define PAGE_RAW                2112
 #define CW_RAW                  528
 #define PAGES_PER_BLOCK         64
+/* Default geometry: the HD2's 512 MiB part. The Dream's 256 MiB K9K2G08
+ * sets blocks=2048 (see hw/arm/dream). */
 #define NUM_BLOCKS              4096
-#define NAND_RAW_SIZE           ((uint64_t)NUM_BLOCKS * PAGES_PER_BLOCK * PAGE_RAW)
+#define NAND_RAW_SIZE(s)        ((uint64_t)(s)->blocks * PAGES_PER_BLOCK * PAGE_RAW)
 
 /*
  * FLASH_STATUS after an operation.  A real HD2 idles at 0x00C00020: bit 5
@@ -91,6 +93,7 @@ struct MsmNandState {
     uint32_t regs[0x40];
     uint8_t buf[NAND_BUF_SIZE];
     uint32_t flash_id;
+    uint32_t blocks;
     bool trace;
 
     /* multi-codeword operation in progress */
@@ -109,7 +112,7 @@ static uint32_t reg(MsmNandState *s, hwaddr off)
 static bool nand_io(MsmNandState *s, uint64_t off, void *data, int len,
                     bool write)
 {
-    if (off + len > NAND_RAW_SIZE) {
+    if (off + len > NAND_RAW_SIZE(s)) {
         return false;
     }
     if (s->blk) {
@@ -304,7 +307,7 @@ static void nand_do_erase(MsmNandState *s)
     uint32_t block = s->op_page / PAGES_PER_BLOCK;
     g_autofree uint8_t *ff = g_malloc(PAGES_PER_BLOCK * PAGE_RAW);
 
-    if (block >= NUM_BLOCKS) {
+    if (block >= s->blocks) {
         return;
     }
     if (s->trace) {
@@ -358,7 +361,7 @@ static void nand_exec(MsmNandState *s)
         s->op_remaining = ((reg(s, NAND_DEV0_CFG0) >> 6) & 7) + 1;
     }
 
-    if (s->op_page >= NUM_BLOCKS * PAGES_PER_BLOCK) {
+    if (s->op_page >= s->blocks * PAGES_PER_BLOCK) {
         memset(s->buf, 0xFF, CW_RAW);
     } else {
         switch (cmd) {
@@ -499,14 +502,15 @@ static void nand_realize(DeviceState *dev, Error **errp)
         if (blk_set_perm(s->blk, perm, BLK_PERM_ALL, errp) < 0) {
             return;
         }
-        if (blk_getlength(s->blk) < NAND_RAW_SIZE) {
+        if (blk_getlength(s->blk) < NAND_RAW_SIZE(s)) {
             error_setg(errp, "msm-nand: image must be at least %" PRIu64
-                       " bytes (4096 blocks x 64 pages x 2112)", NAND_RAW_SIZE);
+                       " bytes (%u blocks x 64 pages x 2112)",
+                       NAND_RAW_SIZE(s), s->blocks);
             return;
         }
     } else {
-        s->mem = g_malloc(NAND_RAW_SIZE);
-        memset(s->mem, 0xFF, NAND_RAW_SIZE);
+        s->mem = g_malloc(NAND_RAW_SIZE(s));
+        memset(s->mem, 0xFF, NAND_RAW_SIZE(s));
     }
 }
 
@@ -525,6 +529,7 @@ static const Property nand_props[] = {
     DEFINE_PROP_DRIVE("drive", MsmNandState, blk),
     /* READ_ID from a real HD2: maker 0xEC, device 0xBC, cfg 0x55 */
     DEFINE_PROP_UINT32("flash-id", MsmNandState, flash_id, 0x5500BCEC),
+    DEFINE_PROP_UINT32("blocks", MsmNandState, blocks, NUM_BLOCKS),
     DEFINE_PROP_BOOL("trace", MsmNandState, trace, false),
 };
 

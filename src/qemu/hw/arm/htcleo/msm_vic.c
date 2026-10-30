@@ -61,6 +61,14 @@ struct MsmVicState {
     int32_t last_irq;
     bool l4;
     bool trace;             /* log the lines software enables */
+    /*
+     * MSM7x01A (ARM11) layout: INT_MASTEREN at 0x64, CONFIG at 0x68,
+     * PROTECTION at 0x6C.  Scorpion moved MASTEREN to 0x68 and CONFIG to
+     * 0x6C.  Without this, the Dream kernel's master enable at 0x64 was
+     * dropped and no IRQ ever reached the core (measured: GPT/DGT lines 7/8
+     * enabled, kernel parked in calibrate_delay).
+     */
+    bool arm11;
     /* "redeliver" lines: edges that came while masked, latched later */
     uint32_t redeliver[2];
     uint32_t held[2];
@@ -175,8 +183,9 @@ static uint64_t vic_read(void *opaque, hwaddr off, unsigned size)
     case 0x40: case 0x44: return s->type[b];
     case 0x50: case 0x54: return s->polarity[b];
     case 0x60: return s->no_pend_val;
-    case 0x68: return s->masteren;
-    case 0x6C: return s->config;
+    case 0x64: return s->arm11 ? s->masteren : 0;
+    case 0x68: return s->arm11 ? s->config : s->masteren;
+    case 0x6C: return s->arm11 ? 0 : s->config;
     case 0x70: case 0x74: return s->security[b];
     case 0x80: case 0x84:
         vic_pending(s, pend);
@@ -274,9 +283,23 @@ static void vic_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     case 0x40: case 0x44: s->type[b] = val; break;
     case 0x50: case 0x54: s->polarity[b] = val; break;
     case 0x60: s->no_pend_val = val; break;
-    case 0x64: break;
-    case 0x68: s->masteren = val; break;
-    case 0x6C: s->config = val; break;
+    case 0x64:
+        if (s->arm11) {
+            s->masteren = val;
+        }
+        break;
+    case 0x68:
+        if (s->arm11) {
+            s->config = val;
+        } else {
+            s->masteren = val;
+        }
+        break;
+    case 0x6C:
+        if (!s->arm11) {
+            s->config = val;
+        }
+        break;
     case 0x70: case 0x74: s->security[b] = val; break;
     case 0xB0: case 0xB4:   /* INT_CLEAR */
         if (s->watch >= 0 && (s->watch >> 5) == b &&
@@ -392,6 +415,7 @@ static void vic_init(Object *obj)
 static const Property vic_props[] = {
     DEFINE_PROP_BOOL("l4", MsmVicState, l4, false),
     DEFINE_PROP_BOOL("trace", MsmVicState, trace, false),
+    DEFINE_PROP_BOOL("arm11", MsmVicState, arm11, false),
     DEFINE_PROP_INT32("watch", MsmVicState, watch, -1),
     DEFINE_PROP_UINT32("redeliver-lo", MsmVicState, redeliver[0], 0),
     DEFINE_PROP_UINT32("redeliver-hi", MsmVicState, redeliver[1], 0),
