@@ -77,6 +77,12 @@ msm_fb, and the first-boot wizard ("Welcome to T-Mobile G1") is up about
 ("android_power: sleep", "deinit sharp panel"). The keyboard is closed
 by default (portrait); F11 slides it out (landscape) and back.
 
+Touch: the pointer over the screen is the finger (left button), with
+`-display sdl` or QMP `input-send-event` abs events. Trackball: arrow keys
+or the mouse wheel (vertical), press with the middle button or F10.
+Measured: tapping the android, the tip and "Next" walks the setup wizard
+to its account page; trackball Down + press opens the Emergency Dialer.
+
 ## Buttons, HBOOT and recovery keys
 
 `-M dream,keys=power+back` holds a combo from power-on (3 s): the SPL
@@ -161,6 +167,19 @@ Rust images' 0xAA fill there the line overflowed a stack buffer.
   rectangle, its size, and the panel position in OUT_XY (0x10194).
 - **Keyboard slide** is SW_LID on GPIO 162 (CPLD bit 2, active low);
   low = closed = portrait.
+
+- **Trackball** ("trout-nav"): two gpio_event_axis inputs, X on GPIO
+  18/19 and Y on GPIO 94/90, 2-bit Gray code with edge interrupts; one
+  detent = four transitions, emitted 2 ms apart. It is GPIO quadrature,
+  not PS/2 (the "mice: PS/2 mouse device" boot line is Linux's generic
+  mousedev).
+- **Touchscreen**: Synaptics RMI on I2C 0x20 (`dream-synaptics`), the
+  trout synaptics_i2c_rmi protocol read from the vmlinux: global
+  0xE0-0xFF, max X/Y in page 0x10, a 15-byte report in page 4 whose
+  status byte must be 0x41 (0x40 alone is accepted but dropped), and
+  attention on CPLD GPIO 167 (IRQ 193). Version 1.0 selects the platform
+  data's entry 1 (inactive edges 0x15DA/0x4C7 of 0x10000, FLIP_Y); screen
+  pixels are mapped through that transform.
 
 ## NAND image layout
 

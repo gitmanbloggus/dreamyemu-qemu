@@ -4,6 +4,7 @@
 #include "../htcleo/htcleo.h"
 
 /* keypad matrix, power key and CPLD key bank; boot_keys e.g. "power+back" */
-void dream_input_init(MsmGpioState *gpio, const char *boot_keys);
+void dream_input_init(MsmGpioState *gpio, const char *boot_keys,
+                      DeviceState *touchscreen);
 
 #endif

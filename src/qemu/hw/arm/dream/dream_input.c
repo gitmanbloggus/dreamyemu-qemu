@@ -31,6 +31,14 @@
  *   switch active = keyboard closed.  Left high it read "open" and
  *   Android 1.0 laid the setup wizard out in landscape (measured).
  *
+ * Trackball: two gpio_event_axis inputs of the "trout-nav" device
+ * (platform data @0xC02A7BDC, infos @0xC02A66F8/0xC02A6720): EV_REL X on
+ * GPIO 18/19 and REL_Y on GPIO 94/90, each a 2-bit Gray code decoded by
+ * the board's map at 0xC002D984, edge interrupts on all four.  Each step
+ * is one transition 00 -> 01 -> 11 -> 10 (or back), emitted one per 2 ms
+ * of virtual time so every edge gets its interrupt.  Host: arrow keys,
+ * mouse wheel (vertical); press = F10 or the middle button.
+ *
  * CPLD (0x98000000): +0x00..+0x06 output shadows (read back), +0x08 the
  * input bank (pressed = 0), interrupt mask +0x0C, status +0x0E (W1C) for
  * that bank; its interrupt output is MSM GPIO 17, active high.  The mask
@@ -53,6 +61,7 @@
 #include "standard-headers/linux/input-event-codes.h"
 #include "../htcleo/htcleo.h"
 #include "dream_input.h"
+#include "dream_synaptics.h"
 
 #define NOUT 7
 #define NIN  8
@@ -86,6 +95,7 @@ static const uint16_t kp_map[NOUT * NIN] = {
 #define GPIO_CPLD_INT       17
 #define CPLD_BIT_TRACKBALL  0       /* GPIO 160 */
 #define CPLD_BIT_LID        2       /* GPIO 162, keyboard slide */
+#define CPLD_BIT_TS_ATT     7       /* GPIO 167, touchscreen attention */
 #define CPLD_BIT_FOCUS      5       /* GPIO 165 */
 #define CPLD_BIT_CAMERA     6       /* GPIO 166 */
 
@@ -93,6 +103,10 @@ static const uint16_t kp_map[NOUT * NIN] = {
 #define CPLD_IN             0x08
 #define CPLD_MASK           0x0C
 #define CPLD_STATUS         0x0E
+
+static const int tb_gpio[2][2] = { { 18, 19 }, { 94, 90 } };
+static const uint8_t gray[4] = { 0, 1, 3, 2 };
+#define TB_STEP_NS          (2 * SCALE_MS)
 
 /*
  * How long -M dream,keys=... holds the keys after power-on: about as long
@@ -112,6 +126,12 @@ typedef struct DreamInput {
     bool power;
     bool kbd_open;          /* keyboard slid out */
     int ps_hold;            /* last PS_HOLD latch */
+    int tb_phase[2];        /* Gray code position per axis */
+    int tb_pending[2];      /* steps still to emit (signed) */
+    QEMUTimer *tb_timer;
+    DeviceState *ts;
+    int touch_x, touch_y;   /* screen pixels */
+    bool touch_down;
     uint8_t boot_cpld;      /* CPLD bits held from power-on */
     bool boot_power;
     int boot_matrix[4];
@@ -275,6 +295,45 @@ static void gpio_out_changed(void *opaque, int pin, int level)
     }
 }
 
+static void tb_out(DreamInput *d, int axis)
+{
+    uint8_t g = gray[d->tb_phase[axis] & 3];
+
+    msm_gpio_set_input(d->gpio, tb_gpio[axis][0], g & 1);
+    msm_gpio_set_input(d->gpio, tb_gpio[axis][1], (g >> 1) & 1);
+}
+
+static void tb_tick(void *opaque)
+{
+    DreamInput *d = opaque;
+    bool more = false;
+
+    for (int a = 0; a < 2; a++) {
+        if (d->tb_pending[a]) {
+            int dir = d->tb_pending[a] > 0 ? 1 : -1;
+
+            d->tb_phase[a] += dir;
+            d->tb_pending[a] -= dir;
+            tb_out(d, a);
+        }
+        more |= d->tb_pending[a] != 0;
+    }
+    if (more) {
+        timer_mod(d->tb_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  TB_STEP_NS);
+    }
+}
+
+/* One detent is a full Gray cycle (4 edges) on that axis */
+static void tb_move(DreamInput *d, int axis, int detents)
+{
+    d->tb_pending[axis] += 4 * detents;
+    if (!timer_pending(d->tb_timer)) {
+        timer_mod(d->tb_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  TB_STEP_NS);
+    }
+}
+
 /* the pressed[] slot (row * NIN + column) of a keycode, or -1 */
 static int matrix_index(int linux_code)
 {
@@ -304,6 +363,18 @@ static void dream_key(DreamInput *d, int code, bool down)
         return;
     case KEY_F10:
         cpld_set_bit(d, CPLD_BIT_TRACKBALL, down);
+        return;
+    case KEY_UP:
+    case KEY_DOWN:
+        if (down) {
+            tb_move(d, 1, code == KEY_DOWN ? 1 : -1);
+        }
+        return;
+    case KEY_LEFT:
+    case KEY_RIGHT:
+        if (down) {
+            tb_move(d, 0, code == KEY_RIGHT ? 1 : -1);
+        }
         return;
     case KEY_F11:
         /* slide the keyboard out or back in */
@@ -340,14 +411,53 @@ static DreamInput *dream_input;
 static void dream_key_event(DeviceState *dev, QemuConsole *src,
                             QemuInputEvent *evt)
 {
-    if (evt->type == INPUT_EVENT_KIND_KEY && dream_input) {
+    if (!dream_input) {
+        return;
+    }
+    if (evt->type == INPUT_EVENT_KIND_KEY) {
         dream_key(dream_input, evt->key.key, evt->key.down);
+    } else if (evt->type == INPUT_EVENT_KIND_BTN) {
+        switch (evt->btn.button) {
+        case INPUT_BUTTON_WHEEL_UP:
+        case INPUT_BUTTON_WHEEL_DOWN:
+            if (evt->btn.down) {
+                tb_move(dream_input, 1,
+                        evt->btn.button == INPUT_BUTTON_WHEEL_DOWN ? 1 : -1);
+            }
+            break;
+        case INPUT_BUTTON_LEFT:
+            dream_input->touch_down = evt->btn.down;
+            if (dream_input->ts) {
+                dream_synaptics_touch(dream_input->ts, evt->btn.down,
+                                      dream_input->touch_x,
+                                      dream_input->touch_y);
+            }
+            break;
+        case INPUT_BUTTON_MIDDLE:
+            cpld_set_bit(dream_input, CPLD_BIT_TRACKBALL, evt->btn.down);
+            break;
+        default:
+            break;
+        }
+    } else if (evt->type == INPUT_EVENT_KIND_ABS) {
+        /* the pointer over the 320x480 screen is the finger */
+        int64_t v = evt->abs.value;
+
+        if (evt->abs.axis == INPUT_AXIS_X) {
+            dream_input->touch_x = v * 320 / (INPUT_EVENT_ABS_MAX + 1);
+        } else if (evt->abs.axis == INPUT_AXIS_Y) {
+            dream_input->touch_y = v * 480 / (INPUT_EVENT_ABS_MAX + 1);
+        }
+        if (dream_input->touch_down && dream_input->ts) {
+            dream_synaptics_touch(dream_input->ts, true, dream_input->touch_x,
+                                  dream_input->touch_y);
+        }
     }
 }
 
 static const QemuInputHandler dream_keyboard = {
-    .name  = "HTC Dream buttons",
-    .mask  = INPUT_EVENT_MASK_KEY,
+    .name  = "HTC Dream buttons, trackball and touchscreen",
+    .mask  = INPUT_EVENT_MASK_KEY | INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_ABS,
     .event = dream_key_event,
 };
 
@@ -385,6 +495,11 @@ static void dream_input_reset(void *opaque)
     d->cpld_status = 0;
     d->power = false;
     d->ps_hold = 1;
+    for (int a = 0; a < 2; a++) {
+        d->tb_phase[a] = 0;
+        d->tb_pending[a] = 0;
+        tb_out(d, a);
+    }
     boot_keys_apply(d, true);
     cpld_update_irq(d);
     if (d->boot_cpld || d->boot_power || d->nboot_matrix) {
@@ -429,9 +544,22 @@ static void parse_boot_keys(DreamInput *d, const char *spec)
     }
 }
 
-void dream_input_init(MsmGpioState *gpio, const char *boot_keys)
+/* the touchscreen's attention output: active low on CPLD bit 7 */
+static void ts_att(void *opaque, int n, int level)
+{
+    cpld_set_bit(opaque, CPLD_BIT_TS_ATT, level);
+}
+
+void dream_input_init(MsmGpioState *gpio, const char *boot_keys,
+                      DeviceState *touchscreen)
 {
     DreamInput *d = g_new0(DreamInput, 1);
+
+    d->ts = touchscreen;
+    if (touchscreen) {
+        qdev_connect_gpio_out_named(touchscreen, "att", 0,
+                                    qemu_allocate_irq(ts_att, d, 0));
+    }
 
     d->gpio = gpio;
     parse_boot_keys(d, boot_keys);
@@ -439,6 +567,7 @@ void dream_input_init(MsmGpioState *gpio, const char *boot_keys)
     memory_region_add_subregion_overlap(get_system_memory(), CPLD_PHYS,
                                         &d->cpld, 1);
     d->release = timer_new_ns(QEMU_CLOCK_VIRTUAL, boot_keys_release, d);
+    d->tb_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tb_tick, d);
     msm_gpio_set_output_notify(gpio, gpio_out_changed, d);
     qemu_input_handler_register(NULL, &dream_keyboard);
     qemu_register_reset(dream_input_reset, d);

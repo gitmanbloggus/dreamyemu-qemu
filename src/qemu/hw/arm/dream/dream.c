@@ -57,6 +57,8 @@
 #include "msm_mddi.h"
 #include "../htcleo/msm_mdp.h"
 #include "dream_input.h"
+#include "dream_synaptics.h"
+#include "hw/i2c/i2c.h"
 #include "../htcleo/msm_modem.h"
 
 #define DREAM_SMI_BASE          0x00000000
@@ -168,6 +170,9 @@ static void dream_init(MachineState *machine)
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *smi = g_new(MemoryRegion, 1);
     DeviceState *vic, *csr, *modem, *mdp, *mddi, *dev;
+    MsmGpioState *gpio;
+    I2CBus *i2c;
+    DeviceState *ts;
     SysBusDevice *sbd;
     Object *cpuobj;
     ARMCPU *cpu;
@@ -275,7 +280,7 @@ static void dream_init(MachineState *machine)
      * pairs in 25 s).  -M dream,keys=power+camera holds a combo at
      * power-on: HBOOT; power+home: recovery; power+back: fastboot.
      */
-    dream_input_init((MsmGpioState *)dev, dream_boot_keys);
+    gpio = (MsmGpioState *)dev;
     {
         DreamVsync *v = g_new0(DreamVsync, 1);
 
@@ -320,8 +325,7 @@ static void dream_init(MachineState *machine)
                        qdev_get_gpio_in(vic, DREAM_INT_NAND_WR_ER_DONE));
 
     /*
-     * I2C: no slaves yet (the trout touchscreen at 0x20, compass, ...),
-     * so probes NACK at once.  Unmapped, every transfer timed out (the
+     * I2C: the touchscreen at 0x20; other chips (compass, ...) NACK at once.  Unmapped, every transfer timed out (the
      * synaptics probe alone took ~0.3 s of guest time).
      */
     dev = qdev_new(TYPE_MSM_I2C);
@@ -329,6 +333,10 @@ static void dream_init(MachineState *machine)
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, DREAM_I2C_PHYS);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_PWB_I2C));
+    i2c = (I2CBus *)qdev_get_child_bus(dev, "i2c");
+    /* the Synaptics touchscreen, attention on CPLD GPIO 167 */
+    ts = DEVICE(i2c_slave_create_simple(i2c, TYPE_DREAM_SYNAPTICS, 0x20));
+    dream_input_init(gpio, dream_boot_keys, ts);
 
     mdp = dev = qdev_new(TYPE_MSM_MDP);
     qdev_prop_set_bit(dev, "mddi", true);
