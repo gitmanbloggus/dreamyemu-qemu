@@ -59,6 +59,26 @@ from `__log_buf` (VA `0xC02C9000` = PA `0x102C9000`, 128 KiB ring):
      handshake on SMSM is not answered (harmless so far, idle falls back).
   4. No I2C slaves (touchscreen at 0x20 NACKs), no SD card (mmc1 timeouts).
 
+## Buttons, HBOOT and recovery keys
+
+`-M dream,keys=power+back` holds a combo from power-on (8 s): the SPL
+returns boot mode 2 and HBOOT shows the Dream's tricolour "rainbow"
+screen (`DREA100 DVT2-1 32A`, `HBOOT-0.95.0000`, `Serial0`) and its
+`UART0:Cmd>` prompt on serial0. On the host keyboard: Esc = Back,
+Home = Home, F1 = Menu, F2 = Send, F12/End = Power (red key), F9 = Camera,
+F8 = Focus, F10 = trackball press, PageUp/PageDown = volume, letters and
+Alt/Shift as on the QWERTY keypad. In recovery Alt+L toggles the menu and
+Home+Back prints "Rebooting..." (the restart itself is not modeled yet).
+
+How the SPL decides (read from the SPL): MISC command first, then the
+reset reason at 0xAA0FC080 (0x776655xx, written by `reboot bootloader`
+etc.), then board op +0x30 of the table at 0x8806FB90, which scans the
+keypad itself. Power (GPIO 20) + Back (column 35 x row 42) gives mode 2.
+
+Use an image converted with `--erase-aa --spl spl.bin`: HBOOT reads its
+own header back from APPSBL (block 0x120) for its title line; with the
+Rust images' 0xAA fill there the line overflowed a stack buffer.
+
 ## Board-specific fixes, and why
 
 - **VIC `arm11` layout.** The MSM7x01A VIC has INT_MASTEREN at 0x64 and
@@ -96,6 +116,18 @@ from `__log_buf` (VA `0xC02C9000` = PA `0x102C9000`, 128 KiB ring):
   mode folds DMA2 onto the DMA_P scanout and refreshes on each kick.
 - **Panel vsync on GPIO 97.** Active-low level interrupt; without it every
   msmfb_pan_display waited out "timeout waiting for frame start".
+
+- **Keypad matrix.** Columns 35,34,33,32,31,23,30 (+109/108/78) are
+  driven low one at a time, rows 42..36 read with pull-ups, a 0 meaning
+  pressed; keymap index = column x 7 + row. Both the SPL and the kernel
+  scan this way (measured: kernel OE/OUT on the columns, level-low IRQs
+  on the rows), so a pressed key is modeled as a switch. Power is GPIO 20
+  (active low); Camera/Focus/trackball are CPLD +0x08 bits 6/5/0.
+- **MDDI panel owns the display.** The SPL draws with MDDI Video Stream
+  packets (RGB 6-6-6, one row each), the kernel through MDP DMA2; both
+  write the client's 320x480 frame memory, shown on one console.
+- **MDDI client registers.** Register Access packets (type 146) in the
+  primary list: writes are kept, reads answered with a reverse packet.
 
 ## NAND image layout
 

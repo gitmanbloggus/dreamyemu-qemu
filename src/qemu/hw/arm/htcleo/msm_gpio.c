@@ -204,6 +204,11 @@ static uint64_t gpio_read(MsmGpioState *s, int proc, int block, hwaddr off)
     GpioIrqState *p = &s->pi[proc];
     hwaddr base = bank_base(proc, block);
 
+    if (s->trace) {
+        qemu_log("msm-gpio: %s GPIO%d read +0x%03" HWADDR_PRIx "\n",
+                 proc == PROC_APPS ? "apps" : "modem", block + 1, off);
+    }
+
     if (off >= base && off < base + 0x110) {
         hwaddr r = off - base;
         for (int b = 0; b < s->nbanks; b++) {

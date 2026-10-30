@@ -24,8 +24,19 @@ Hypotheses, not measured: the SPL's own read path and the kernel's CFG1
 (BAD_BLOCK_BYTE_NUM = 465, marker in user area) -- check them against
 `-global msm-nand.trace=on` on the first run.
 
+--erase-aa: pages whose data is entirely 0xAA become erased 0xFF pages
+(the Rust images leave the spare 0xFF on those). dreamyemu's cria_nand.py fills unwritten NAND with 0xAA;
+real erased flash reads 0xFF, and HBOOT reads config from blank areas:
+with 0xAA it built pointers like 0xFEAAAABC and crashed (measured).
+
+--spl FILE: write the SPL/HBOOT image into APPSBL (block 0x120, per the
+radio's partition table, docs/dream-modem.md), as on the phone. HBOOT
+reads its own header back from there for the version in its title line;
+with 0xAA there the line overflowed a stack buffer ("HBOOT-" + 12 bytes
+of 0xAA, saved LR = "HVT\0") and HBOOT crashed after "ARM11 Boot Mode:2".
+
 Usage:
-    python3 tools/dream_nand.py IN.img OUT.img
+    python3 tools/dream_nand.py [--erase-aa] [--spl SPL.bin] IN.img OUT.img
 """
 
 import sys
@@ -34,6 +45,7 @@ PAGE, SPARE = 2048, 64
 REC = PAGE + SPARE
 CW_USER, CW_RAW = 516, 528
 BB_POS = PAGE - 3 * CW_RAW          # 464
+APPSBL_BLOCK = 0x120
 
 
 def converte_pagina(rec):
@@ -52,6 +64,14 @@ def converte_pagina(rec):
 
 
 def main(argv):
+    erase_aa = "--erase-aa" in argv
+    argv = [a for a in argv if a != "--erase-aa"]
+    spl = None
+    if "--spl" in argv:
+        i = argv.index("--spl")
+        spl = open(argv[i + 1], "rb").read()
+        del argv[i:i + 2]
+    spl_first = APPSBL_BLOCK * 64
     if len(argv) != 3:
         print(__doc__.split("Usage:")[1].strip())
         return 2
@@ -62,6 +82,14 @@ def main(argv):
             if not rec:
                 break
             assert len(rec) == REC, f"truncated page {n}"
+            if erase_aa and rec[:PAGE] == b"\xaa" * PAGE:
+                rec = b"\xff" * REC
+            if spl is not None and spl_first <= n < spl_first + 6 * 64:
+                chunk = spl[(n - spl_first) * PAGE:(n - spl_first + 1) * PAGE]
+                if chunk:
+                    rec = chunk.ljust(PAGE, b"\xff") + b"\xff" * SPARE
+                else:
+                    rec = b"\xff" * REC
             fs.write(converte_pagina(rec))
             n += 1
     print(f"{argv[2]}: {n} pages ({n // 64} blocks)")

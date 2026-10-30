@@ -129,7 +129,14 @@ static void mdp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     if (s->mddi) {
         switch (off) {
         case MDP22_DMA2_START:
-            s->invalidate = true;
+            if (s->mddi_sink) {
+                uint32_t size = s->regs[MDP_DMA_P_SIZE >> 2];
+
+                s->mddi_sink(s->mddi_opaque,
+                             s->regs[MDP_DMA_P_IBUF_ADDR >> 2],
+                             s->regs[MDP_DMA_P_IBUF_Y_STRIDE >> 2],
+                             size & 0x7FF, (size >> 16) & 0x7FF);
+            }
             msm_mdp_raise(s, MDP22_INT_DMA2_DONE);
             return;
         case MDP22_DMA2_CONFIG:
@@ -338,10 +345,21 @@ static void mdp_reset(DeviceState *dev)
     mdp_update_irq(s);
 }
 
+void msm_mdp_set_mddi_sink(MsmMdpState *s,
+                           void (*sink)(void *, uint32_t, uint32_t, int, int),
+                           void *opaque)
+{
+    s->mddi_sink = sink;
+    s->mddi_opaque = opaque;
+}
+
 static void mdp_realize(DeviceState *dev, Error **errp)
 {
     MsmMdpState *s = MSM_MDP(dev);
 
+    if (s->mddi) {
+        return;     /* the MDDI client (panel) owns the display */
+    }
     s->con = qemu_graphic_console_create(dev, 0, &mdp_gfx_ops, s);
     qemu_console_resize(s->con, PANEL_W, PANEL_H);
 }

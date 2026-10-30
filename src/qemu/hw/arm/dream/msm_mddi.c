@@ -29,6 +29,31 @@
  * bring-up), 320x480.  Packet layout per the MDDI client caps packet
  * (76 bytes, length field 74).
  *
+ * Client registers: the host walks each primary list (PRI_PTR) for
+ * Register Access packets (type 146).  Writes land in a small register
+ * file; a read (read_write_info bit 15) is answered with a type-146
+ * reverse packet {length 16, type, client, info, address, crc, data}
+ * and REV_DATA_AVAIL.  Measured from the SPL's list at SMI 0x280000:
+ * packed entry {u16 flags, u16 header_count, u16 data_count, u32 data
+ * @+6, u32 next @+10}, packet at +16: a read is {14, 146, 0, 0x8001,
+ * 0x00150000}; a write is {0x12, 146, 0, 0x0001, addr} with its value
+ * at the data pointer (data_count 4).  Without answers the
+ * SPL logged "MddiWaitReserve Fail [2A001]" per read and gave up on the
+ * panel (bIsDisplayInited=0); the kernel logged "unknown panel id".
+ * Unwritten registers read 0: the panel ID the hardware returns is not
+ * known yet.
+ *
+ * The panel: the client keeps its own 320x480 RGB565 frame memory, shown
+ * on a QEMU console.  Two writers reach it, as on the phone:
+ *  - Video Stream packets (type 16) in a primary list, which is how the
+ *    SPL/HBOOT draws: one packet per row, format 0x5666, window
+ *    0..319 x 0..479, start (0, row), 320 pixels at the entry's data
+ *    pointer (measured from its lists at SMI 0x230000, 0x28 bytes each).
+ *    0x5666 is RGB 6-6-6: 18-bit pixels packed as a little-endian bit
+ *    stream, blue lowest (720 bytes per 320-pixel row; read as 565 it
+ *    came out as 9-pixel colour stripes).  0x5565 is plain RGB565;
+ *  - the MDP's DMA2 output (the kernel's msm_fb), via msm_mddi_panel_blit.
+ *
  * This code is licensed under the GNU GPL v2 or later.
  */
 
@@ -41,6 +66,8 @@
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
+#include "ui/console.h"
+#include "ui/pixel_ops.h"
 #include "msm_mddi.h"
 
 #define MDDI_CMD        0x00
@@ -56,6 +83,9 @@
 #define MDDI_REV_PKT_CNT 0x44
 
 #define MDDI_INT_REV_DATA_AVAIL     0x00000004
+#define MDDI_TYPE_REG_ACCESS        146
+#define MDDI_TYPE_VIDEO             16
+#define MDDI_NREGS                  32
 #define MDDI_CMD_GET_CLIENT_CAP     0x0601
 #define MDDI_CMD_FORCE_NEW_REV_PTR  0x0C00
 
@@ -87,6 +117,11 @@ struct MsmMddiState {
     uint32_t intr;          /* latched INT bits */
     uint32_t rev_off;       /* next write offset in the reverse buffer */
     uint32_t rev_pkts;      /* REV_PKT_CNT */
+    uint32_t creg_addr[MDDI_NREGS], creg_val[MDDI_NREGS];
+    int ncregs;
+    QemuConsole *con;
+    uint16_t *panel;        /* client frame memory, RGB565 */
+    bool dirty;
     bool trace;
 };
 
@@ -132,6 +167,186 @@ static void mddi_send_caps(MsmMddiState *s)
     stw_le_p(p + 62, MDDI_CLIENT_MFR);      /* Mfr_Name */
     stw_le_p(p + 64, MDDI_CLIENT_PRODUCT);  /* Product_Code */
     mddi_rev_packet(s, p, sizeof(p));
+}
+
+static uint32_t *mddi_creg(MsmMddiState *s, uint32_t addr, bool create)
+{
+    for (int i = 0; i < s->ncregs; i++) {
+        if (s->creg_addr[i] == addr) {
+            return &s->creg_val[i];
+        }
+    }
+    if (!create || s->ncregs == MDDI_NREGS) {
+        return NULL;
+    }
+    s->creg_addr[s->ncregs] = addr;
+    s->creg_val[s->ncregs] = 0;
+    return &s->creg_val[s->ncregs++];
+}
+
+static void mddi_reg_reply(MsmMddiState *s, uint32_t addr)
+{
+    uint8_t p[18] = { 0 };
+    uint32_t *v = mddi_creg(s, addr, false);
+
+    stw_le_p(p + 0, sizeof(p) - 2);
+    stw_le_p(p + 2, MDDI_TYPE_REG_ACCESS);
+    stw_le_p(p + 6, 1);
+    stl_le_p(p + 8, addr);
+    stl_le_p(p + 14, v ? *v : 0);
+    mddi_rev_packet(s, p, sizeof(p));
+}
+
+/* A Video Stream packet: pixels into the panel's frame memory */
+static void mddi_video(MsmMddiState *s, const uint8_t *pk, uint32_t dptr,
+                       uint32_t dcount)
+{
+    uint16_t fmt = lduw_le_p(pk + 6);
+    int xl = lduw_le_p(pk + 10), yt = lduw_le_p(pk + 12);
+    int xr = lduw_le_p(pk + 14), yb = lduw_le_p(pk + 16);
+    int x = lduw_le_p(pk + 18), y = lduw_le_p(pk + 20);
+    int n = lduw_le_p(pk + 22);
+    g_autofree uint8_t *raw = NULL;
+    int bpp = (fmt == 0x5666) ? 18 : 16;
+
+    if (s->trace) {
+        qemu_log("msm-mddi: video fmt 0x%04x win %d,%d-%d,%d at %d,%d n %d "
+                 "data 0x%x/%u\n", fmt, xl, yt, xr, yb, x, y, n, dptr, dcount);
+    }
+    if ((fmt != 0x5565 && fmt != 0x5666) || !dptr || !n) {
+        return;     /* RGB565 and RGB666 so far */
+    }
+    n = MIN(n, (int)(dcount * 8 / bpp));
+    raw = g_malloc0(dcount + 4);
+    address_space_read(&address_space_memory, dptr, MEMTXATTRS_UNSPECIFIED,
+                       raw, dcount);
+    for (int i = 0; i < n; i++) {
+        uint16_t p;
+
+        if (bpp == 16) {
+            p = lduw_le_p(raw + 2 * i);
+        } else {
+            unsigned bit = i * 18;
+            uint32_t v = ldl_le_p(raw + bit / 8) >> (bit % 8);
+            uint32_t b = v & 0x3F, g = (v >> 6) & 0x3F, r = (v >> 12) & 0x3F;
+
+            p = ((r >> 1) << 11) | (g << 5) | (b >> 1);
+        }
+        if (x >= 0 && x < MDDI_CLIENT_WIDTH && y >= 0 &&
+            y < MDDI_CLIENT_HEIGHT) {
+            s->panel[y * MDDI_CLIENT_WIDTH + x] = p;
+        }
+        if (++x > xr) {
+            x = xl;
+            if (++y > yb) {
+                y = yt;
+            }
+        }
+    }
+    s->dirty = true;
+}
+
+void msm_mddi_panel_blit(DeviceState *dev, uint32_t base, uint32_t stride,
+                         int w, int h)
+{
+    MsmMddiState *s = MSM_MDDI(dev);
+
+    w = MIN(w, MDDI_CLIENT_WIDTH);
+    h = MIN(h, MDDI_CLIENT_HEIGHT);
+    for (int y = 0; y < h; y++) {
+        address_space_read(&address_space_memory, base + y * stride,
+                           MEMTXATTRS_UNSPECIFIED,
+                           s->panel + y * MDDI_CLIENT_WIDTH, w * 2);
+    }
+    s->dirty = true;
+}
+
+static bool mddi_gfx_update(void *opaque)
+{
+    MsmMddiState *s = opaque;
+    DisplaySurface *surf = qemu_console_surface(s->con);
+    uint8_t *dst;
+    int dstride;
+
+    if (!s->dirty) {
+        return true;
+    }
+    if (surface_width(surf) != MDDI_CLIENT_WIDTH ||
+        surface_height(surf) != MDDI_CLIENT_HEIGHT) {
+        qemu_console_resize(s->con, MDDI_CLIENT_WIDTH, MDDI_CLIENT_HEIGHT);
+        surf = qemu_console_surface(s->con);
+    }
+    dst = surface_data(surf);
+    dstride = surface_stride(surf);
+    for (int y = 0; y < MDDI_CLIENT_HEIGHT; y++) {
+        uint32_t *d = (uint32_t *)(dst + y * dstride);
+        for (int x = 0; x < MDDI_CLIENT_WIDTH; x++) {
+            uint16_t p = le16_to_cpu(s->panel[y * MDDI_CLIENT_WIDTH + x]);
+            uint8_t r = (p >> 11) << 3, g = ((p >> 5) & 0x3F) << 2,
+                    b = (p & 0x1F) << 3;
+            d[x] = rgb_to_pixel32(r | r >> 5, g | g >> 6, b | b >> 5);
+        }
+    }
+    qemu_console_update(s->con, 0, 0, MDDI_CLIENT_WIDTH, MDDI_CLIENT_HEIGHT);
+    s->dirty = false;
+    return true;
+}
+
+static void mddi_gfx_invalidate(void *opaque)
+{
+    MsmMddiState *s = opaque;
+    s->dirty = true;
+}
+
+static const GraphicHwOps mddi_gfx_ops = {
+    .invalidate = mddi_gfx_invalidate,
+    .gfx_update = mddi_gfx_update,
+};
+
+/* Walk a primary list for client register accesses and video */
+static void mddi_run_list(MsmMddiState *s, uint32_t ent)
+{
+    for (int n = 0; ent && n < 256; n++) {
+        uint8_t e[16 + 26];
+        uint16_t hdr, type, info;
+        uint32_t next, dptr, addr;
+
+        address_space_read(&address_space_memory, ent, MEMTXATTRS_UNSPECIFIED,
+                           e, sizeof(e));
+        hdr = lduw_le_p(e + 2);
+        dptr = ldl_le_p(e + 6);
+        next = ldl_le_p(e + 10);
+        type = lduw_le_p(e + 18);
+        info = lduw_le_p(e + 22);
+        addr = ldl_le_p(e + 24);
+        if (hdr >= 24 && type == MDDI_TYPE_VIDEO) {
+            mddi_video(s, e + 16, dptr, lduw_le_p(e + 4));
+        } else if (hdr >= 12 && type == MDDI_TYPE_REG_ACCESS) {
+            if (info & 0x8000) {
+                if (s->trace) {
+                    qemu_log("msm-mddi: client reg read 0x%x\n", addr);
+                }
+                mddi_reg_reply(s, addr);
+            } else if (dptr && lduw_le_p(e + 4) >= 4) {
+                uint32_t val = 0;
+                uint32_t *r = mddi_creg(s, addr, true);
+
+                address_space_read(&address_space_memory, dptr,
+                                   MEMTXATTRS_UNSPECIFIED, &val, 4);
+                val = le32_to_cpu(val);
+                if (r) {
+                    *r = val;
+                }
+                if (s->trace) {
+                    qemu_log("msm-mddi: client reg 0x%x <- 0x%x\n", addr, val);
+                }
+            }
+        }
+        if (next == ent) {
+            break;
+        }
+        ent = next;
+    }
 }
 
 /* What finishing a command (or a primary packet list) raises */
@@ -218,6 +433,7 @@ static void mddi_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         break;
     case MDDI_PRI_PTR:
         /* the list is sent at once; the link wakes for it */
+        mddi_run_list(s, val);
         s->intr |= MDDI_INT_PRI_PTR_READ | MDDI_INT_PRI_LINK_LIST_DONE |
                    MDDI_INT_NO_CMD_PKTS_PEND | MDDI_INT_LINK_ACTIVE;
         break;
@@ -243,7 +459,17 @@ static void mddi_reset(DeviceState *dev)
     memset(s->regs, 0, sizeof(s->regs));
     s->intr = MDDI_INT_NO_CMD_PKTS_PEND;
     s->rev_off = s->rev_pkts = 0;
+    s->ncregs = 0;
     mddi_update_irq(s);
+}
+
+static void mddi_realize(DeviceState *dev, Error **errp)
+{
+    MsmMddiState *s = MSM_MDDI(dev);
+
+    s->panel = g_new0(uint16_t, MDDI_CLIENT_WIDTH * MDDI_CLIENT_HEIGHT);
+    s->con = qemu_graphic_console_create(dev, 0, &mddi_gfx_ops, s);
+    qemu_console_resize(s->con, MDDI_CLIENT_WIDTH, MDDI_CLIENT_HEIGHT);
 }
 
 static void mddi_init(Object *obj)
@@ -277,6 +503,7 @@ static void mddi_class_init(ObjectClass *oc, const void *data)
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     device_class_set_legacy_reset(dc, mddi_reset);
+    dc->realize = mddi_realize;
     device_class_set_props(dc, mddi_props);
     dc->vmsd = &mddi_vmstate;
 }

@@ -55,6 +55,8 @@
 #include "../htcleo/htcleo.h"
 #include "../htcleo/msm_regfile.h"
 #include "msm_mddi.h"
+#include "../htcleo/msm_mdp.h"
+#include "dream_input.h"
 #include "../htcleo/msm_modem.h"
 
 #define DREAM_SMI_BASE          0x00000000
@@ -94,7 +96,6 @@
 #define DREAM_INT_NAND_WR_ER_DONE   36
 #define DREAM_INT_NAND_OP_DONE      37
 
-#define DREAM_GPIO_CPLD_INT     17
 #define DREAM_GPIO_LCD_VSYNC    97
 
 /* K9K2G08: maker 0xEC, device 0xAA, 2 KiB pages, 128 KiB blocks, x8 */
@@ -130,11 +131,30 @@ static void dream_modem_reset(void *opaque)
     msm_modem_boot(MSM_MODEM(opaque));
 }
 
+static char *dream_boot_keys;
+
+static void dream_dma2_to_panel(void *opaque, uint32_t base, uint32_t stride,
+                                int w, int h)
+{
+    msm_mddi_panel_blit(opaque, base, stride, w, h);
+}
+
+static char *dream_get_keys(Object *obj, Error **errp)
+{
+    return g_strdup(dream_boot_keys ? dream_boot_keys : "");
+}
+
+static void dream_set_keys(Object *obj, const char *value, Error **errp)
+{
+    g_free(dream_boot_keys);
+    dream_boot_keys = g_strdup(value);
+}
+
 static void dream_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *smi = g_new(MemoryRegion, 1);
-    DeviceState *vic, *csr, *modem, *dev;
+    DeviceState *vic, *csr, *modem, *mdp, *mddi, *dev;
     SysBusDevice *sbd;
     Object *cpuobj;
     ARMCPU *cpu;
@@ -235,13 +255,12 @@ static void dream_init(MachineState *machine)
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_GPIO_GROUP1));
     sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(vic, DREAM_INT_GPIO_GROUP2));
     /*
-     * GPIO 17 is the trout CPLD's interrupt output: active high (the kernel
-     * sets POS=1 on bank 1 bit 1), held low by the CPLD while nothing is
-     * pending.  Left floating high it stormed trout_gpio_irq_handler
-     * (measured: 1.69M POS/CLEAR pairs in 25 s, boot stuck after
-     * "cpld_usb_hw2_sw").
+     * Buttons, and the CPLD whose interrupt is GPIO 17 (active high; left
+     * floating high it stormed trout_gpio_irq_handler, 1.69M POS/CLEAR
+     * pairs in 25 s).  -M dream,keys=power+camera holds a combo at
+     * power-on: HBOOT; power+home: recovery; power+back: fastboot.
      */
-    msm_gpio_set_input((MsmGpioState *)dev, DREAM_GPIO_CPLD_INT, 0);
+    dream_input_init((MsmGpioState *)dev, dream_boot_keys);
     {
         DreamVsync *v = g_new0(DreamVsync, 1);
 
@@ -296,7 +315,7 @@ static void dream_init(MachineState *machine)
     sysbus_mmio_map(sbd, 0, DREAM_I2C_PHYS);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_PWB_I2C));
 
-    dev = qdev_new(TYPE_MSM_MDP);
+    mdp = dev = qdev_new(TYPE_MSM_MDP);
     qdev_prop_set_bit(dev, "mddi", true);
     qdev_prop_set_uint32(dev, "panel-width", 320);
     qdev_prop_set_uint32(dev, "panel-height", 480);
@@ -305,11 +324,13 @@ static void dream_init(MachineState *machine)
     sysbus_mmio_map(sbd, 0, DREAM_MDP_PHYS);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_MDP));
 
-    dev = qdev_new(TYPE_MSM_MDDI);
+    mddi = dev = qdev_new(TYPE_MSM_MDDI);
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, DREAM_PMDH_PHYS);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_MDDI_PRI));
+    /* DMA2 frames go over MDDI to the panel, which owns the display */
+    msm_mdp_set_mddi_sink(MSM_MDP(mdp), dream_dma2_to_panel, mddi);
 
     /* Clock controller: plain read-back registers until something polls */
     dev = qdev_new(TYPE_MSM_REGFILE);
@@ -343,6 +364,10 @@ static void dream_machine_class_init(ObjectClass *oc, const void *data)
     mc->no_cdrom = true;
     mc->no_floppy = true;
     mc->no_parallel = true;
+    object_class_property_add_str(oc, "keys", dream_get_keys, dream_set_keys);
+    object_class_property_set_description(oc, "keys",
+        "Buttons held at power-on, e.g. power+camera (HBOOT), power+home "
+        "(recovery), power+back (fastboot)");
 }
 
 static const TypeInfo dream_machine_types[] = {

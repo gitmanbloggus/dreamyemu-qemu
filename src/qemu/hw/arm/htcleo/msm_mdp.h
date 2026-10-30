@@ -28,9 +28,16 @@ struct MsmMdpState {
     uint32_t panel_w, panel_h;  /* default the HD2's 480x800 */
     bool trace;
     bool mddi;                  /* MDP 2.x DMA2 -> MDDI (the Dream) */
+    /* mddi: where DMA2 frames go (the panel owns the display) */
+    void (*mddi_sink)(void *opaque, uint32_t base, uint32_t stride, int w,
+                      int h);
+    void *mddi_opaque;
 };
 
 void msm_mdp_raise(MsmMdpState *s, uint32_t bits);
+void msm_mdp_set_mddi_sink(MsmMdpState *s,
+                           void (*sink)(void *, uint32_t, uint32_t, int, int),
+                           void *opaque);
 void msm_mdp_ppp_run(MsmMdpState *s);
 void msm_mdp_set_backlight(MsmMdpState *s, int level);
 void msm_mdp_setup_scanout(MsmMdpState *s, uint32_t base, uint32_t w,
