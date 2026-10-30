@@ -39,15 +39,15 @@ from `__log_buf` (VA `0xC02C9000` = PA `0x102C9000`, 128 KiB ring):
   registered, `Freeing init memory`, init parses the recovery init.rc and
   yaffs mounts `cache` (mtdblock4) from the image.
 - Open, in order:
-  1. **Recovery runs and draws.** MDDI answers GET_CLIENT_CAP with a
-     client capability packet (Mfr 0xD263, product 0, 320x480), the kernel
-     publishes `mddi_c_d263_0000`, `msmfb_probe() installing 320 x 480
-     panel`, and /sbin/recovery draws its error screen into the fb at
-     SMI 0x03800000 (both halves of the double buffer, read back with
-     `pmemsave 0x03800000 0x96000`). Still missing: the frame-start
-     signal (`msmfb_pan_display timeout waiting for frame start`), the
-     panel register read (`mddi_remote_read(150000) timeout` -> "unknown
-     panel id"), and showing the fb on QEMU's display.
+  1. **Recovery is on QEMU's display.** MDDI answers GET_CLIENT_CAP
+     (Mfr 0xD263, product 0, 320x480), the kernel binds
+     `mddi_c_d263_0000` and `msmfb_probe() installing 320 x 480 panel`;
+     msm-mdp in `mddi` mode scans the MDP 2.x DMA2 buffer out to a
+     320x480 console on each kick (0x10044), and the board pulses the
+     panel vsync on GPIO 97 at 60 Hz, so page flips no longer time out.
+     `-display sdl` (or `screendump` in the monitor) shows stock recovery's
+     error screen. Still open: the panel ID register read
+     (`mddi_remote_read(150000) timeout` -> "unknown panel id").
   2. **Guest clock slow:** ~2.65 s of kernel time after 120 s of wall
      time, CPU mostly in the idle loop. The DGT model defaults to /4
      (HD2); check what the trout timer code assumes for the DGT rate.
@@ -85,6 +85,13 @@ from `__log_buf` (VA `0xC02C9000` = PA `0x102C9000`, 128 KiB ring):
 - **MDDI INT latched / write-1-to-clear.** Reporting every INT bit as set
   stormed the kernel ISR, which tracks the link by flipping between
   LINK_ACTIVE and IN_HIBERNATION.
+
+- **MDP `mddi` mode.** The Dream's MDP 2.x has its DMA2 block at 0x10180
+  (config, size, IBUF, stride) kicked at 0x10044 with "done" on bit 2,
+  and no LCDC; the HD2's MDP 3.1 scans DMA_P while its LCDC runs. The
+  mode folds DMA2 onto the DMA_P scanout and refreshes on each kick.
+- **Panel vsync on GPIO 97.** Active-low level interrupt; without it every
+  msmfb_pan_display waited out "timeout waiting for frame start".
 
 ## NAND image layout
 

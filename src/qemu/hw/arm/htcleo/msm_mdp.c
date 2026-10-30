@@ -18,6 +18,7 @@
  * This code is licensed under the GNU GPL v2 or later.
  */
 #include "qemu/osdep.h"
+#include "hw/core/qdev-properties.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "qemu/module.h"
@@ -44,6 +45,21 @@
 #define MDP_DMA_P_IBUF_Y_STRIDE 0x9000C
 #define MDP_DMA_P_OUT_XY    0x90010
 #define MDP_LCDC_EN         0xE0000
+
+/*
+ * MDP 2.x (MSM7x01A, the Dream), measured from the trout kernel driving
+ * an MDDI panel: DMA2 config 0x10180, size 0x10184 (h << 16 | w),
+ * IBUF 0x10188, stride 0x1018C, kick 0x10044; INTR_ENABLE 0x18BF, with
+ * DMA2 done on bit 2 (DL0_DMA2_TERM_DONE).  No LCDC: the panel is
+ * refreshed only when DMA2 is kicked.  Its registers are folded onto the
+ * DMA_P ones so scanout is shared.
+ */
+#define MDP22_DMA2_START    0x10044
+#define MDP22_DMA2_CONFIG   0x10180
+#define MDP22_DMA2_SIZE     0x10184
+#define MDP22_DMA2_IBUF     0x10188
+#define MDP22_DMA2_STRIDE   0x1018C
+#define MDP22_INT_DMA2_DONE (1u << 2)
 #define MDP_PPP_SCALE_STATUS 0x50000
 #define MDP_PPP_BLEND_STATUS 0x70000
 
@@ -52,8 +68,8 @@
 #define INT_DMA_P_DONE      (1u << 14)
 #define INT_LCDC_FRAME_START (1u << 15)
 
-#define PANEL_W 480
-#define PANEL_H 800
+#define PANEL_W (s->panel_w)
+#define PANEL_H (s->panel_h)
 
 static void mdp_update_irq(MsmMdpState *s)
 {
@@ -105,6 +121,31 @@ static void mdp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 
     if (off >= MDP_SIZE) {
         return;
+    }
+    if (s->trace && off != MDP_INTR_CLEAR) {
+        qemu_log("msm-mdp: write 0x%05" HWADDR_PRIx " = 0x%08x\n", off,
+                 (uint32_t)val);
+    }
+    if (s->mddi) {
+        switch (off) {
+        case MDP22_DMA2_START:
+            s->invalidate = true;
+            msm_mdp_raise(s, MDP22_INT_DMA2_DONE);
+            return;
+        case MDP22_DMA2_CONFIG:
+            /* 16 bpp unless the guest says otherwise: keep fmt = 565 */
+            s->regs[MDP_DMA_P_CONFIG >> 2] = 1u << 25;
+            break;
+        case MDP22_DMA2_SIZE:
+            s->regs[MDP_DMA_P_SIZE >> 2] = val;
+            break;
+        case MDP22_DMA2_IBUF:
+            s->regs[MDP_DMA_P_IBUF_ADDR >> 2] = val;
+            break;
+        case MDP22_DMA2_STRIDE:
+            s->regs[MDP_DMA_P_IBUF_Y_STRIDE >> 2] = val;
+            break;
+        }
     }
     switch (off) {
     case MDP_INTR_ENABLE:
@@ -193,9 +234,10 @@ static bool mdp_gfx_update(void *opaque)
     uint8_t *dst;
     int dstride;
     g_autofree uint8_t *line = NULL;
-    bool on = (s->regs[MDP_LCDC_EN >> 2] & 1) && base && s->panel_on &&
+    bool on = s->mddi ? base != 0 :
+              (s->regs[MDP_LCDC_EN >> 2] & 1) && base && s->panel_on &&
               s->brightness;
-    unsigned br = s->brightness;
+    unsigned br = s->mddi ? 255 : s->brightness;
 
     if (!w || w > PANEL_W) {
         w = PANEL_W;
@@ -316,10 +358,18 @@ static void mdp_init(Object *obj)
     s->vsync = timer_new_ns(QEMU_CLOCK_VIRTUAL, mdp_vsync, s);
 }
 
+static const Property mdp_props[] = {
+    DEFINE_PROP_UINT32("panel-width", MsmMdpState, panel_w, 480),
+    DEFINE_PROP_UINT32("panel-height", MsmMdpState, panel_h, 800),
+    DEFINE_PROP_BOOL("trace", MsmMdpState, trace, false),
+    DEFINE_PROP_BOOL("mddi", MsmMdpState, mddi, false),
+};
+
 static void mdp_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
+    device_class_set_props(dc, mdp_props);
     dc->realize = mdp_realize;
     device_class_set_legacy_reset(dc, mdp_reset);
 }

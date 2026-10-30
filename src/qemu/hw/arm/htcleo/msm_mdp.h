@@ -25,6 +25,9 @@ struct MsmMdpState {
     bool panel_on;
     uint64_t ppp_ops;
     uint8_t brightness;         /* LCD backlight, 0 = off */
+    uint32_t panel_w, panel_h;  /* default the HD2's 480x800 */
+    bool trace;
+    bool mddi;                  /* MDP 2.x DMA2 -> MDDI (the Dream) */
 };
 
 void msm_mdp_raise(MsmMdpState *s, uint32_t bits);

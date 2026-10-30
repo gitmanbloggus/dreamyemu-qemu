@@ -35,6 +35,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "qemu/timer.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "hw/core/boards.h"
@@ -94,10 +95,34 @@
 #define DREAM_INT_NAND_OP_DONE      37
 
 #define DREAM_GPIO_CPLD_INT     17
+#define DREAM_GPIO_LCD_VSYNC    97
 
 /* K9K2G08: maker 0xEC, device 0xAA, 2 KiB pages, 128 KiB blocks, x8 */
 #define DREAM_NAND_ID           0x1500AAECu
 #define DREAM_NAND_BLOCKS       2048
+
+/*
+ * The MDDI panel's vsync: GPIO 97 ("vsync on gpio 97 now 1" in the
+ * kernel log), a level interrupt with POS = 0, so the panel pulses it low
+ * once a frame.  msmfb_pan_display waits on it before each DMA2 kick
+ * ("timeout waiting for frame start" without it).  60 Hz, 100 us low.
+ */
+typedef struct DreamVsync {
+    QEMUTimer *timer;
+    MsmGpioState *gpio;
+    bool low;
+} DreamVsync;
+
+static void dream_vsync_tick(void *opaque)
+{
+    DreamVsync *v = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    v->low = !v->low;
+    msm_gpio_set_input(v->gpio, DREAM_GPIO_LCD_VSYNC, !v->low);
+    timer_mod(v->timer, now + (v->low ? 100 * SCALE_US :
+                               NANOSECONDS_PER_SECOND / 60 - 100 * SCALE_US));
+}
 
 /* SMEM as AMSS leaves it when it releases the apps core */
 static void dream_modem_reset(void *opaque)
@@ -215,6 +240,14 @@ static void dream_init(MachineState *machine)
      * "cpld_usb_hw2_sw").
      */
     msm_gpio_set_input((MsmGpioState *)dev, DREAM_GPIO_CPLD_INT, 0);
+    {
+        DreamVsync *v = g_new0(DreamVsync, 1);
+
+        v->gpio = (MsmGpioState *)dev;
+        v->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dream_vsync_tick, v);
+        timer_mod(v->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  NANOSECONDS_PER_SECOND / 60);
+    }
 
     /* UART1 is the SPL/kernel console (serial0); UART3 the trout debug port */
     for (int i = 0; i < 3; i++) {
@@ -262,6 +295,9 @@ static void dream_init(MachineState *machine)
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_PWB_I2C));
 
     dev = qdev_new(TYPE_MSM_MDP);
+    qdev_prop_set_bit(dev, "mddi", true);
+    qdev_prop_set_uint32(dev, "panel-width", 320);
+    qdev_prop_set_uint32(dev, "panel-height", 480);
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, DREAM_MDP_PHYS);
