@@ -21,6 +21,7 @@
  * This code is licensed under the GNU GPL v2 or later.
  */
 #include "qemu/osdep.h"
+#include "hw/core/qdev-properties.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "qemu/module.h"
@@ -48,6 +49,8 @@ struct MsmCsrState {
     MemoryRegion iomem;
     MsmTimer t[2];          /* 0 = GPT, 1 = DGT */
     uint32_t dgt_div;
+    uint32_t dgt_div_reset; /* boot divider: 3 on the HD2, 0 on the Dream */
+    bool dgt_free_running;  /* DGT counts while disabled (the Dream) */
     uint32_t regs[0x400];   /* everything we do not model, readback only */
     qemu_irq a2m[CSR_NUM_A2M];
     DeviceState *modem;     /* msm-modem: it may answer proc_comm itself */
@@ -67,7 +70,12 @@ static uint32_t timer_count(MsmTimer *t)
     uint64_t ticks;
     uint32_t c;
 
-    if (!(t->enable & 1) && t->is_dgt) {
+    /*
+     * The trout kernel reads the DGT as its clocksource without ever
+     * setting ENABLE (measured: DGT COUNT stuck at 0 after 50 s while the
+     * GPT counted 39.6 s), so on the Dream it free-runs like the GPT.
+     */
+    if (!(t->enable & 1) && t->is_dgt && !t->csr->dgt_free_running) {
         return t->count_base;
     }
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -256,7 +264,14 @@ static void csr_reset(DeviceState *dev)
         s->t[i].base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         timer_del(s->t[i].timer);
     }
-    s->dgt_div = 3;     /* 19.2 MHz / 4 = 4.8 MHz, the boot default */
+    /*
+     * HD2: 19.2 MHz / 4 = 4.8 MHz, the boot default htcleo writes again.
+     * The MSM7x01A has no divider write in its kernel and counts at the
+     * full 19.2 MHz: the trout msm_clocks[] says dg_timer 600000 Hz,
+     * shift 5 (vmlinux 0xC02A4564).  At /4 the Dream's DGT time ran 4x
+     * slow.
+     */
+    s->dgt_div = s->dgt_div_reset;
     memset(s->regs, 0, sizeof(s->regs));
     /*
      * SPSS_CLK_SEL (+0x104): the SPL leaves the Scorpion running from the
@@ -292,10 +307,16 @@ static void csr_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(obj), s->a2m, "a2m", CSR_NUM_A2M);
 }
 
+static const Property csr_props[] = {
+    DEFINE_PROP_UINT32("dgt-div", MsmCsrState, dgt_div_reset, 3),
+    DEFINE_PROP_BOOL("dgt-free-running", MsmCsrState, dgt_free_running, false),
+};
+
 static void csr_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     device_class_set_legacy_reset(dc, csr_reset);
+    device_class_set_props(dc, csr_props);
 }
 
 static const TypeInfo msm_csr_info = {

@@ -48,9 +48,13 @@ from `__log_buf` (VA `0xC02C9000` = PA `0x102C9000`, 128 KiB ring):
      `-display sdl` (or `screendump` in the monitor) shows stock recovery's
      error screen. Still open: the panel ID register read
      (`mddi_remote_read(150000) timeout` -> "unknown panel id").
-  2. **Guest clock slow:** ~2.65 s of kernel time after 120 s of wall
-     time, CPU mostly in the idle loop. The DGT model defaults to /4
-     (HD2); check what the trout timer code assumes for the DGT rate.
+  2. ~~Guest clock slow~~ **fixed.** The trout kernel's `msm_clocks[]`
+     (vmlinux 0xC02A4564) has dg_timer at 600000 Hz with shift 5, i.e. the
+     DGT counting at 19.2 MHz, and uses it as clocksource without ever
+     setting its ENABLE bit. The HD2 CSR model counted the DGT at /4 and
+     only while enabled, so the Dream's DGT read 0 forever. With
+     `dgt-div=0` and `dgt-free-running=on`, jiffies advance 1000 per 10 s
+     of wall time (HZ=100, measured).
   3. `msm_pm_wait_state(80, ...) failed`: the 2.6.25 power-collapse
      handshake on SMSM is not answered (harmless so far, idle falls back).
   4. No I2C slaves (touchscreen at 0x20 NACKs), no SD card (mmc1 timeouts).

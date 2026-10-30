@@ -186,6 +186,8 @@ static void dream_init(MachineState *machine)
     sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_FIQ));
 
     csr = dev = qdev_new(TYPE_MSM_CSR);
+    qdev_prop_set_uint32(dev, "dgt-div", 0);    /* DGT at 19.2 MHz */
+    qdev_prop_set_bit(dev, "dgt-free-running", true);
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, DREAM_CSR_PHYS);
