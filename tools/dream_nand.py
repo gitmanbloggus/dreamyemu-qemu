@@ -35,8 +35,15 @@ reads its own header back from there for the version in its title line;
 with 0xAA there the line overflowed a stack buffer ("HBOOT-" + 12 bytes
 of 0xAA, saved LR = "HVT\0") and HBOOT crashed after "ARM11 Boot Mode:2".
 
+--nbh DREAIMG.nbh: write the RUU's boot.img and recovery.img into their
+own partitions (Linux mtd offsets are NAND byte offsets: recovery
+0x026C0000, boot 0x02BC0000), as the phone has them, so the SPL boots
+boot.img normally and recovery only when asked. NBH item table: types at
+0x140, offsets (+0x100) at 0x1C0, lengths at 0x240 (docs/dream-modem.md).
+
 Usage:
-    python3 tools/dream_nand.py [--erase-aa] [--spl SPL.bin] IN.img OUT.img
+    python3 tools/dream_nand.py [--erase-aa] [--spl SPL.bin] [--nbh RUU.nbh]
+                                IN.img OUT.img
 """
 
 import sys
@@ -63,6 +70,28 @@ def converte_pagina(rec):
     return bytes(saida)
 
 
+def nbh_read(path):
+    if path.endswith(".zip"):
+        import zipfile
+        with zipfile.ZipFile(path) as z:
+            name = next(i.filename for i in z.infolist()
+                        if i.filename.lower().endswith(".nbh"))
+            return z.read(name)
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def nbh_item(nbh, want):
+    import struct
+    types = struct.unpack_from("<32I", nbh, 0x140)
+    offs = struct.unpack_from("<32I", nbh, 0x1C0)
+    lens = struct.unpack_from("<32I", nbh, 0x240)
+    for ty, off, ln in zip(types, offs, lens):
+        if ty == want:
+            return nbh[off + 0x100:off + 0x100 + ln]
+    raise SystemExit(f"NBH item 0x{want:x} not found")
+
+
 def main(argv):
     erase_aa = "--erase-aa" in argv
     argv = [a for a in argv if a != "--erase-aa"]
@@ -72,6 +101,13 @@ def main(argv):
         spl = open(argv[i + 1], "rb").read()
         del argv[i:i + 2]
     spl_first = APPSBL_BLOCK * 64
+    parts = {}          # first page -> image bytes
+    if "--nbh" in argv:
+        i = argv.index("--nbh")
+        nbh = nbh_read(argv[i + 1])
+        del argv[i:i + 2]
+        for ty, off in ((0xB05, 0x026C0000), (0xB04, 0x02BC0000)):
+            parts[off // PAGE] = nbh_item(nbh, ty)
     if len(argv) != 3:
         print(__doc__.split("Usage:")[1].strip())
         return 2
@@ -84,6 +120,10 @@ def main(argv):
             assert len(rec) == REC, f"truncated page {n}"
             if erase_aa and rec[:PAGE] == b"\xaa" * PAGE:
                 rec = b"\xff" * REC
+            for first, img in parts.items():
+                if first <= n < first + (len(img) + PAGE - 1) // PAGE:
+                    chunk = img[(n - first) * PAGE:(n - first + 1) * PAGE]
+                    rec = chunk.ljust(PAGE, b"\xff") + b"\xff" * SPARE
             if spl is not None and spl_first <= n < spl_first + 6 * 64:
                 chunk = spl[(n - spl_first) * PAGE:(n - spl_first + 1) * PAGE]
                 if chunk:

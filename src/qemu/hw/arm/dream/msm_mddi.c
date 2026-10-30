@@ -64,6 +64,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
+#include "qemu/timer.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "ui/console.h"
@@ -86,6 +87,7 @@
 #define MDDI_TYPE_REG_ACCESS        146
 #define MDDI_TYPE_VIDEO             16
 #define MDDI_NREGS                  32
+#define MDDI_LIST_NS                20000       /* 20 us */
 #define MDDI_CMD_GET_CLIENT_CAP     0x0601
 #define MDDI_CMD_FORCE_NEW_REV_PTR  0x0C00
 
@@ -119,6 +121,7 @@ struct MsmMddiState {
     uint32_t rev_pkts;      /* REV_PKT_CNT */
     uint32_t creg_addr[MDDI_NREGS], creg_val[MDDI_NREGS];
     int ncregs;
+    QEMUTimer *list_done;   /* a primary list finishes after a moment */
     QemuConsole *con;
     uint16_t *panel;        /* client frame memory, RGB565 */
     bool dirty;
@@ -247,16 +250,19 @@ static void mddi_video(MsmMddiState *s, const uint8_t *pk, uint32_t dptr,
 }
 
 void msm_mddi_panel_blit(DeviceState *dev, uint32_t base, uint32_t stride,
-                         int w, int h)
+                         int w, int h, int x, int y)
 {
     MsmMddiState *s = MSM_MDDI(dev);
 
-    w = MIN(w, MDDI_CLIENT_WIDTH);
-    h = MIN(h, MDDI_CLIENT_HEIGHT);
-    for (int y = 0; y < h; y++) {
-        address_space_read(&address_space_memory, base + y * stride,
+    if (x >= MDDI_CLIENT_WIDTH || y >= MDDI_CLIENT_HEIGHT) {
+        return;
+    }
+    w = MIN(w, MDDI_CLIENT_WIDTH - x);
+    h = MIN(h, MDDI_CLIENT_HEIGHT - y);
+    for (int r = 0; r < h; r++) {
+        address_space_read(&address_space_memory, base + r * stride,
                            MEMTXATTRS_UNSPECIFIED,
-                           s->panel + y * MDDI_CLIENT_WIDTH, w * 2);
+                           s->panel + (y + r) * MDDI_CLIENT_WIDTH + x, w * 2);
     }
     s->dirty = true;
 }
@@ -432,10 +438,18 @@ static void mddi_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         mddi_command(s, val);
         break;
     case MDDI_PRI_PTR:
-        /* the list is sent at once; the link wakes for it */
+        /*
+         * The list's effects are immediate; its completion is raised a
+         * moment later, as the hardware takes time to send it.  Raised at
+         * once, the kernel's ISR consumed PRI_LINK_LIST_DONE before
+         * mddi_remote_write enabled it, and every write waited out
+         * "mddi_wait_interrupt ... timeout waiting for 8000" (measured,
+         * normal boot, from 9.7 s on).
+         */
         mddi_run_list(s, val);
-        s->intr |= MDDI_INT_PRI_PTR_READ | MDDI_INT_PRI_LINK_LIST_DONE |
-                   MDDI_INT_NO_CMD_PKTS_PEND | MDDI_INT_LINK_ACTIVE;
+        s->intr |= MDDI_INT_LINK_ACTIVE;
+        timer_mod(s->list_done, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  MDDI_LIST_NS);
         break;
     }
     s->regs[off / 4] = val;
@@ -463,11 +477,21 @@ static void mddi_reset(DeviceState *dev)
     mddi_update_irq(s);
 }
 
+static void mddi_list_done(void *opaque)
+{
+    MsmMddiState *s = opaque;
+
+    s->intr |= MDDI_INT_PRI_PTR_READ | MDDI_INT_PRI_LINK_LIST_DONE |
+               MDDI_INT_NO_CMD_PKTS_PEND;
+    mddi_update_irq(s);
+}
+
 static void mddi_realize(DeviceState *dev, Error **errp)
 {
     MsmMddiState *s = MSM_MDDI(dev);
 
     s->panel = g_new0(uint16_t, MDDI_CLIENT_WIDTH * MDDI_CLIENT_HEIGHT);
+    s->list_done = timer_new_ns(QEMU_CLOCK_VIRTUAL, mddi_list_done, s);
     s->con = qemu_graphic_console_create(dev, 0, &mddi_gfx_ops, s);
     qemu_console_resize(s->con, MDDI_CLIENT_WIDTH, MDDI_CLIENT_HEIGHT);
 }

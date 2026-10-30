@@ -134,9 +134,9 @@ static void dream_modem_reset(void *opaque)
 static char *dream_boot_keys;
 
 static void dream_dma2_to_panel(void *opaque, uint32_t base, uint32_t stride,
-                                int w, int h)
+                                int w, int h, int x, int y)
 {
-    msm_mddi_panel_blit(opaque, base, stride, w, h);
+    msm_mddi_panel_blit(opaque, base, stride, w, h, x, y);
 }
 
 static char *dream_get_keys(Object *obj, Error **errp)
@@ -148,6 +148,19 @@ static void dream_set_keys(Object *obj, const char *value, Error **errp)
 {
     g_free(dream_boot_keys);
     dream_boot_keys = g_strdup(value);
+}
+
+static ARMCPU *dream_cpu;
+
+/*
+ * A full reset, as after PS_HOLD drops or PCOM_RESET_CHIP: devices, the
+ * SPL image (a ROM blob, copied back), and the core at 0 with the MMU off.
+ * The core has to be reset by hand: it hangs off no bus.
+ */
+static void dream_reset(MachineState *machine, ResetType type)
+{
+    qemu_devices_reset(type);
+    cpu_reset(CPU(dream_cpu));
 }
 
 static void dream_init(MachineState *machine)
@@ -170,6 +183,7 @@ static void dream_init(MachineState *machine)
     qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
     object_unref(cpuobj);
     cpu = ARM_CPU(cpuobj);
+    dream_cpu = cpu;
 
     memory_region_init_ram(smi, NULL, "dream.smi", DREAM_SMI_SIZE,
                            &error_fatal);
@@ -248,6 +262,7 @@ static void dream_init(MachineState *machine)
 
     dev = qdev_new(TYPE_MSM_GPIO);
     qdev_prop_set_bit(dev, "msm7x01a", true);
+    qdev_prop_set_int32(dev, "ps-hold", 25);
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, DREAM_GPIO1_PHYS);
@@ -356,6 +371,7 @@ static void dream_machine_class_init(ObjectClass *oc, const void *data)
 
     mc->desc = "HTC Dream / T-Mobile G1 (Qualcomm MSM7201A)";
     mc->init = dream_init;
+    mc->reset = dream_reset;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("arm1136");
     mc->default_ram_size = DREAM_EBI1_SIZE;
     mc->default_ram_id = "dream.ebi1";

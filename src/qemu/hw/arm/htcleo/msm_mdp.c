@@ -59,6 +59,7 @@
 #define MDP22_DMA2_SIZE     0x10184
 #define MDP22_DMA2_IBUF     0x10188
 #define MDP22_DMA2_STRIDE   0x1018C
+#define MDP22_DMA2_OUT_XY   0x10194  /* y << 16 | x on the panel */
 #define MDP22_INT_DMA2_DONE (1u << 2)
 #define MDP_PPP_SCALE_STATUS 0x50000
 #define MDP_PPP_BLEND_STATUS 0x70000
@@ -132,10 +133,14 @@ static void mdp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             if (s->mddi_sink) {
                 uint32_t size = s->regs[MDP_DMA_P_SIZE >> 2];
 
+                uint32_t xy = s->regs[MDP22_DMA2_OUT_XY >> 2];
+
+                /* msm_fb sends dirty rectangles: IBUF at the rect's start */
                 s->mddi_sink(s->mddi_opaque,
                              s->regs[MDP_DMA_P_IBUF_ADDR >> 2],
                              s->regs[MDP_DMA_P_IBUF_Y_STRIDE >> 2],
-                             size & 0x7FF, (size >> 16) & 0x7FF);
+                             size & 0x7FF, (size >> 16) & 0x7FF,
+                             xy & 0x7FF, (xy >> 16) & 0x7FF);
             }
             msm_mdp_raise(s, MDP22_INT_DMA2_DONE);
             return;
@@ -346,7 +351,8 @@ static void mdp_reset(DeviceState *dev)
 }
 
 void msm_mdp_set_mddi_sink(MsmMdpState *s,
-                           void (*sink)(void *, uint32_t, uint32_t, int, int),
+                           void (*sink)(void *, uint32_t, uint32_t, int, int,
+                                        int, int),
                            void *opaque)
 {
     s->mddi_sink = sink;

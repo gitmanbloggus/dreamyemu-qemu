@@ -59,6 +59,24 @@ from `__log_buf` (VA `0xC02C9000` = PA `0x102C9000`, 128 KiB ring):
      handshake on SMSM is not answered (harmless so far, idle falls back).
   4. No I2C slaves (touchscreen at 0x20 NACKs), no SD card (mmc1 timeouts).
 
+## Normal boot: Android 1.0
+
+```bash
+python3 tools/dream_nand.py --erase-aa --spl spl.bin --nbh DREAIMG-RC29.zip \
+    nand_bringup.img images/dream_nand_boot.img
+src/qemu/build/qemu-system-arm -M dream -bios spl.bin \
+    -drive if=mtd,format=raw,file=images/dream_nand_boot.img -display sdl
+```
+
+`--nbh` puts the RUU's boot.img and recovery.img in their own partitions
+(Linux mtd offsets are NAND byte offsets: recovery 0x026C0000, boot
+0x02BC0000), so the SPL boots boot.img. Measured: system, userdata and
+cache mount from NAND, rild opens SMD DS, SurfaceFlinger draws through
+msm_fb, and the first-boot wizard ("Welcome to T-Mobile G1") is up about
+30 s after power-on; Android then sleeps the panel after its timeout
+("android_power: sleep", "deinit sharp panel"). The keyboard is closed
+by default (portrait); F11 slides it out (landscape) and back.
+
 ## Buttons, HBOOT and recovery keys
 
 `-M dream,keys=power+back` holds a combo from power-on (3 s): the SPL
@@ -68,7 +86,8 @@ screen (`DREA100 DVT2-1 32A`, `HBOOT-0.95.0000`, `Serial0`) and its
 Home = Home, F1 = Menu, F2 = Send, F12/End = Power (red key), F9 = Camera,
 F8 = Focus, F10 = trackball press, PageUp/PageDown = volume, letters and
 Alt/Shift as on the QWERTY keypad. In recovery Alt+L toggles the menu and
-Home+Back prints "Rebooting..." (the restart itself is not modeled yet).
+Home+Back reboots: the trout reset hook drops PS_HOLD (GPIO 25), which
+resets the board, and the SPL starts again.
 
 How the SPL decides (read from the SPL): MISC command first, then the
 reset reason at 0xAA0FC080 (0x776655xx, written by `reboot bootloader`
@@ -128,6 +147,20 @@ Rust images' 0xAA fill there the line overflowed a stack buffer.
   write the client's 320x480 frame memory, shown on one console.
 - **MDDI client registers.** Register Access packets (type 146) in the
   primary list: writes are kept, reads answered with a reverse packet.
+
+- **PS_HOLD and reset.** GPIO 25's latch starts high; when the kernel's
+  reset hook (vmlinux 0xC002DAB8, gpio_set_value(25, 0)) drops it, the
+  machine resets, CPU included (it hangs off no bus, so `mc->reset` resets
+  it by hand).
+- **Panel ID.** The kernel takes (client reg 0x150000 >> 4) & 3 and knows
+  0 and 1; with register reads answered it reads 0 and binds "sharp".
+- **MDDI list completion** is raised 20 us after PRI_PTR: raised at once,
+  the kernel's ISR consumed PRI_LINK_LIST_DONE before the writer enabled
+  it, and register writes waited out their timeouts.
+- **Partial updates.** msm_fb sends dirty rectangles: DMA2 IBUF at the
+  rectangle, its size, and the panel position in OUT_XY (0x10194).
+- **Keyboard slide** is SW_LID on GPIO 162 (CPLD bit 2, active low);
+  low = closed = portrait.
 
 ## NAND image layout
 

@@ -26,7 +26,10 @@
  *   KEY_END (the Dream's red key, also power) on GPIO 20, KEY_FOCUS on
  *   165, KEY_CAMERA on 166; BTN_LEFT (trackball press) on 160.  GPIOs
  *   160-167 are the trout CPLD's input bank at CPLD +0x08, which the SPL
- *   also reads (Camera + Power at power-on = HBOOT).
+ *   also reads.  SW_LID, the keyboard slide, is GPIO 162 (CPLD bit 2,
+ *   gpio_event_input_info @0xC02A8040, type EV_SW, active low): low =
+ *   switch active = keyboard closed.  Left high it read "open" and
+ *   Android 1.0 laid the setup wizard out in landscape (measured).
  *
  * CPLD (0x98000000): +0x00..+0x06 output shadows (read back), +0x08 the
  * input bank (pressed = 0), interrupt mask +0x0C, status +0x0E (W1C) for
@@ -45,6 +48,7 @@
 #include "qemu/error-report.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
+#include "system/runstate.h"
 #include "ui/input.h"
 #include "standard-headers/linux/input-event-codes.h"
 #include "../htcleo/htcleo.h"
@@ -70,8 +74,18 @@ static const uint16_t kp_map[NOUT * NIN] = {
 };
 
 #define GPIO_POWER          20
+/*
+ * PS_HOLD.  The trout kernel restarts through msm_pm_restart (vmlinux
+ * 0xC003C334): with the default reason 0x776655AA it calls the board hook
+ * at 0xC002DAB8, which is gpio_set_value(25, 0) and nothing else.  On the
+ * phone that drops the PMIC's PS_HOLD and the board restarts; here the
+ * latch falling 1 -> 0 requests a system reset.  (Other reasons go
+ * through proc_comm PCOM_RESET_CHIP, which msm-modem already answers.)
+ */
+#define GPIO_PS_HOLD        25
 #define GPIO_CPLD_INT       17
 #define CPLD_BIT_TRACKBALL  0       /* GPIO 160 */
+#define CPLD_BIT_LID        2       /* GPIO 162, keyboard slide */
 #define CPLD_BIT_FOCUS      5       /* GPIO 165 */
 #define CPLD_BIT_CAMERA     6       /* GPIO 166 */
 
@@ -96,6 +110,8 @@ typedef struct DreamInput {
     uint8_t cpld_status;
     bool pressed[NOUT * NIN];
     bool power;
+    bool kbd_open;          /* keyboard slid out */
+    int ps_hold;            /* last PS_HOLD latch */
     uint8_t boot_cpld;      /* CPLD bits held from power-on */
     bool boot_power;
     int boot_matrix[4];
@@ -228,6 +244,12 @@ static void matrix_update(DreamInput *d)
 static void gpio_out_changed(void *opaque, int pin, int level)
 {
     DreamInput *d = opaque;
+    int ps = msm_gpio_get_output_latch(d->gpio, GPIO_PS_HOLD);
+
+    if (d->ps_hold == 1 && ps == 0) {
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
+    d->ps_hold = ps;
 
     if (pin == -1) {
         matrix_update(d);
@@ -282,6 +304,13 @@ static void dream_key(DreamInput *d, int code, bool down)
         return;
     case KEY_F10:
         cpld_set_bit(d, CPLD_BIT_TRACKBALL, down);
+        return;
+    case KEY_F11:
+        /* slide the keyboard out or back in */
+        if (down) {
+            d->kbd_open = !d->kbd_open;
+            cpld_set_bit(d, CPLD_BIT_LID, !d->kbd_open);
+        }
         return;
     case KEY_ESC:
         code = KEY_BACK;
@@ -350,9 +379,12 @@ static void dream_input_reset(void *opaque)
     memset(d->shadow, 0, sizeof(d->shadow));
     memset(d->pressed, 0, sizeof(d->pressed));
     d->cpld_in = 0xFF;
+    d->kbd_open = false;
+    d->cpld_in &= ~(1u << CPLD_BIT_LID);       /* keyboard closed */
     d->cpld_mask = 0xFF;
     d->cpld_status = 0;
     d->power = false;
+    d->ps_hold = 1;
     boot_keys_apply(d, true);
     cpld_update_irq(d);
     if (d->boot_cpld || d->boot_power || d->nboot_matrix) {

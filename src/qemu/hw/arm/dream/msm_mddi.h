@@ -7,6 +7,6 @@
 
 /* The MDP's DMA2 output to the panel: RGB565 rows from guest memory */
 void msm_mddi_panel_blit(DeviceState *mddi, uint32_t base, uint32_t stride,
-                         int w, int h);
+                         int w, int h, int x, int y);
 
 #endif

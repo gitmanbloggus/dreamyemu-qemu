@@ -82,6 +82,11 @@ struct MsmGpioState {
 
     bool msm7x01a;                  /* bank layout: Dream instead of HD2 */
     bool trace;                     /* log guest register writes */
+    /*
+     * PS_HOLD (the Dream: GPIO 25): its output latch starts high, as the
+     * boot chain leaves it; software drops it to have the PMIC cut power.
+     */
+    int32_t ps_hold;
     const GpioBank *banks;
     int nbanks;
 };
@@ -310,6 +315,13 @@ static void gpio_reset(DeviceState *dev)
     for (int b = 0; b < s->nbanks; b++) {
         s->out[b] = s->oe[b] = 0;
     }
+    if (s->ps_hold >= 0) {
+        int bit, b = pin_bank(s, s->ps_hold, &bit);
+
+        if (b >= 0) {
+            s->out[b] |= 1u << bit;
+        }
+    }
     memset(s->pi, 0, sizeof(s->pi));
     for (int proc = 0; proc < 2; proc++) {
         for (int b = 0; b < s->nbanks; b++) {
@@ -353,6 +365,7 @@ static void gpio_realize(DeviceState *dev, Error **errp)
 static const Property gpio_props[] = {
     DEFINE_PROP_BOOL("msm7x01a", MsmGpioState, msm7x01a, false),
     DEFINE_PROP_BOOL("trace", MsmGpioState, trace, false),
+    DEFINE_PROP_INT32("ps-hold", MsmGpioState, ps_hold, -1),
 };
 
 static void gpio_class_init(ObjectClass *oc, const void *data)
