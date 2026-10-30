@@ -61,7 +61,7 @@ from `__log_buf` (VA `0xC02C9000` = PA `0x102C9000`, 128 KiB ring):
 
 ## Buttons, HBOOT and recovery keys
 
-`-M dream,keys=power+back` holds a combo from power-on (8 s): the SPL
+`-M dream,keys=power+back` holds a combo from power-on (3 s): the SPL
 returns boot mode 2 and HBOOT shows the Dream's tricolour "rainbow"
 screen (`DREA100 DVT2-1 32A`, `HBOOT-0.95.0000`, `Serial0`) and its
 `UART0:Cmd>` prompt on serial0. On the host keyboard: Esc = Back,

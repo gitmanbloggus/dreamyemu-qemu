@@ -80,8 +80,12 @@ static const uint16_t kp_map[NOUT * NIN] = {
 #define CPLD_MASK           0x0C
 #define CPLD_STATUS         0x0E
 
-/* how long -M dream,keys=... holds the keys after power-on */
-#define BOOT_HOLD_NS        (8 * NANOSECONDS_PER_SECOND)
+/*
+ * How long -M dream,keys=... holds the keys after power-on: about as long
+ * as a person holds the combo.  Power+Back held 3 s still gives boot
+ * mode 2 (HBOOT), measured.
+ */
+#define BOOT_HOLD_NS        (3 * NANOSECONDS_PER_SECOND)
 
 typedef struct DreamInput {
     MsmGpioState *gpio;
