@@ -30,15 +30,25 @@ from `__log_buf` (VA `0xC02C9000` = PA `0x102C9000`, 128 KiB ring):
 
 ## State (2026-10-30)
 
-- SPL: full run on UART1. MDDI/display init, NAND read of the recovery
-  boot image (header, kernel 0x153004 B, ramdisk 0x5A831 B), ATAGs,
-  cmdline, handoff (r1 = 0x5A0 trout, r2 = 0x10000100, r3 = 0x10008000).
-- Kernel (2.6.25 trout): `Machine: trout`, IRQs, timers, calibrate delay
-  (815.92 BogoMIPS), up to `trout_init() revision=170`.
-- Wall: `proc_comm: TIMEOUT. modem has probably crashed`. Nothing answers
-  the modem's shared-memory protocols yet. `msm_modem.c` speaks them for
-  the HD2 (AMSS 15.42, SMEM at 0x00100000); the Dream needs its SMEM at
-  0x01F00000 and the 2.6.25 trout proc_comm/SMD/SMSM layout.
+- SPL: full run on UART1 (display init, NAND load of the recovery image,
+  ATAGs, handoff with r1 = 0x5A0 trout).
+- Kernel (2.6.25 trout, recovery ramdisk): runs to **init**. proc_comm,
+  SMSM and SMD answered by `msm-modem` in `smd-v1` mode (RPCCALL, DIAG,
+  DS channels open), slow-clock sync done, NAND probed as `1500aaec`
+  with all six MTD partitions, USB/adb up, keypad and trackball drivers
+  registered, `Freeing init memory`, init parses the recovery init.rc and
+  yaffs mounts `cache` (mtdblock4) from the image.
+- Open, in order:
+  1. **No fb0.** MDDI reports no client ("mddi_pmdh: no client found"),
+     so the panel driver never binds and msm_fb never registers. Next:
+     answer GET_CLIENT_CAP with reverse packets (client ID 0xD263 per
+     the Rust bring-up) so the trout panel binds.
+  2. **Guest clock slow:** ~2.65 s of kernel time after 120 s of wall
+     time, CPU mostly in the idle loop. The DGT model defaults to /4
+     (HD2); check what the trout timer code assumes for the DGT rate.
+  3. `msm_pm_wait_state(80, ...) failed`: the 2.6.25 power-collapse
+     handshake on SMSM is not answered (harmless so far, idle falls back).
+  4. No I2C slaves (touchscreen at 0x20 NACKs), no SD card (mmc1 timeouts).
 
 ## Board-specific fixes, and why
 
@@ -56,6 +66,20 @@ from `__log_buf` (VA `0xC02C9000` = PA `0x102C9000`, 128 KiB ring):
 - **MDDI host.** First cut: commands finish at once, INT/STAT read as an
   idle host with the link up, CORE_VER 0x20. The SPL spun forever on
   MDDI_INT without it. No client and no reverse packets yet.
+
+- **GPIO `msm7x01a` layout.** Five banks (0-106) with the 7x01A register
+  offsets instead of the QSD8x50's eight. GPIO 17 (the trout CPLD
+  interrupt, active high) is driven low; floating high it stormed
+  trout_gpio_irq_handler.
+- **Modem `smd-v1`.** The 2.6.25 kernel's SMEM differs from the HD2's in
+  the details: SMD channels are one item each with inline 8 KiB FIFOs,
+  SMSM is two `{host, state}` pairs (16 bytes), the channel names are
+  stored without the `SMD_` prefix, and time sync uses SMSM_TIMEWAIT
+  0x400 / TIMEINIT 0x800 (read from the vmlinux at 0xC002B0C0). With no
+  SMEM image, the model builds the heap AMSS would leave.
+- **MDDI INT latched / write-1-to-clear.** Reporting every INT bit as set
+  stormed the kernel ISR, which tracks the link by flipping between
+  LINK_ACTIVE and IN_HIBERNATION.
 
 ## NAND image layout
 

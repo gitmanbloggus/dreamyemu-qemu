@@ -7,14 +7,18 @@
  * +0x18 in 20 s with a plain unimplemented page), and the kernel's
  * mddi_init refuses a core version <= 31.
  *
- * This model has no link and no client: every command finishes at once,
- * INT/STAT read as an idle host with the link up (all status bits set
- * except the four error bits), and the interrupt line is (INT & INTEN).
- * That is the state the dreamyemu (Rust) harness pre-filled into its page
- * (INT/STAT all-ones, version 0x20) to get the SPL and mddi_init through;
- * the error bits are cleared here because a host that reports underflow
- * and CRC errors is not idle.  Reverse packets (client caps, RTD) are not
- * modeled yet: that is the next step once the kernel asks for them.
+ * This model has no client.  Every command finishes at once and latches
+ * the events a real host would raise for it into INT, which the guest
+ * clears by writing the bits back (W1C); the interrupt line is
+ * (INT & INTEN).  An earlier cut reported every INT bit as always set:
+ * enough for the SPL, but the kernel's ISR tracks the link by flipping
+ * between LINK_ACTIVE and IN_HIBERNATION and stormed (measured: 2.2M
+ * INT/INTEN writes in 30 s, INTEN alternating 0x2000/0x4000).
+ *
+ * Bits and commands: trout drivers/video/msm/mddi_hw.h as recalled;
+ * NO_CMD_PKTS_PEND = 0x20000 is confirmed by the Rust run's
+ * "mddi_wait_interrupt ... timeout waiting for 20000".  Reverse packets
+ * (client caps, RTD) are not modeled yet.
  *
  * This code is licensed under the GNU GPL v2 or later.
  */
@@ -34,9 +38,18 @@
 #define MDDI_STAT       0x28
 #define MDDI_CORE_VER   0x8C
 
-/* PRI/SEC underflow, reverse overflow, CRC error */
-#define MDDI_INT_ERRORS 0x000000F0u
-#define MDDI_INT_IDLE   (0xFFFFFFFFu & ~MDDI_INT_ERRORS)
+#define MDDI_PRI_PTR    0x08
+
+#define MDDI_INT_PRI_PTR_READ       0x00000001
+#define MDDI_INT_SEC_PTR_READ       0x00000002
+#define MDDI_INT_LINK_ACTIVE        0x00002000
+#define MDDI_INT_IN_HIBERNATION     0x00004000
+#define MDDI_INT_PRI_LINK_LIST_DONE 0x00008000
+#define MDDI_INT_NO_CMD_PKTS_PEND   0x00020000
+
+#define MDDI_CMD_HIBERNATE          0x0300
+#define MDDI_CMD_LINK_ACTIVE        0x0900
+
 #define MDDI_STAT_IDLE  0xFFFFFFFFu
 #define MDDI_VERSION    0x0020
 
@@ -47,12 +60,30 @@ struct MsmMddiState {
     MemoryRegion iomem;
     qemu_irq irq;
     uint32_t regs[0x100 / 4];
+    uint32_t intr;          /* latched INT bits */
     bool trace;
 };
 
 static void mddi_update_irq(MsmMddiState *s)
 {
-    qemu_set_irq(s->irq, !!(MDDI_INT_IDLE & s->regs[MDDI_INTEN / 4]));
+    qemu_set_irq(s->irq, !!(s->intr & s->regs[MDDI_INTEN / 4]));
+}
+
+/* What finishing a command (or a primary packet list) raises */
+static void mddi_command(MsmMddiState *s, uint32_t cmd)
+{
+    uint32_t ev = MDDI_INT_NO_CMD_PKTS_PEND;
+
+    switch (cmd & 0xFF00) {
+    case MDDI_CMD_HIBERNATE:
+        /* bit 0 set = auto-hibernate on: the idle link sleeps */
+        ev |= (cmd & 1) ? MDDI_INT_IN_HIBERNATION : MDDI_INT_LINK_ACTIVE;
+        break;
+    case MDDI_CMD_LINK_ACTIVE:
+        ev |= MDDI_INT_LINK_ACTIVE;
+        break;
+    }
+    s->intr |= ev;
 }
 
 static uint64_t mddi_read(void *opaque, hwaddr off, unsigned size)
@@ -62,7 +93,7 @@ static uint64_t mddi_read(void *opaque, hwaddr off, unsigned size)
 
     switch (off) {
     case MDDI_INT:
-        v = MDDI_INT_IDLE;
+        v = s->intr;
         break;
     case MDDI_STAT:
         v = MDDI_STAT_IDLE;
@@ -91,10 +122,21 @@ static void mddi_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     if (off >= sizeof(s->regs) || off == MDDI_CORE_VER) {
         return;
     }
-    s->regs[off / 4] = val;
-    if (off == MDDI_INTEN || off == MDDI_CMD) {
-        mddi_update_irq(s);
+    switch (off) {
+    case MDDI_INT:
+        s->intr &= ~val;
+        break;
+    case MDDI_CMD:
+        mddi_command(s, val);
+        break;
+    case MDDI_PRI_PTR:
+        /* the list is sent at once; the link wakes for it */
+        s->intr |= MDDI_INT_PRI_PTR_READ | MDDI_INT_PRI_LINK_LIST_DONE |
+                   MDDI_INT_NO_CMD_PKTS_PEND | MDDI_INT_LINK_ACTIVE;
+        break;
     }
+    s->regs[off / 4] = val;
+    mddi_update_irq(s);
 }
 
 static const MemoryRegionOps mddi_ops = {
@@ -112,6 +154,7 @@ static void mddi_reset(DeviceState *dev)
     MsmMddiState *s = MSM_MDDI(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    s->intr = MDDI_INT_NO_CMD_PKTS_PEND;
     mddi_update_irq(s);
 }
 
@@ -130,6 +173,7 @@ static const VMStateDescription mddi_vmstate = {
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, MsmMddiState, 0x100 / 4),
+        VMSTATE_UINT32(intr, MsmMddiState),
         VMSTATE_END_OF_LIST()
     },
 };

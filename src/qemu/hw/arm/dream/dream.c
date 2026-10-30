@@ -14,6 +14,7 @@
  *   CLK_CTL    0xA8600000
  *   GPIO1/2    0xA9200000 / 0xA9300000
  *   DMOV       0xA9700000
+ *   I2C        0xA9900000
  *   UART1..3   0xA9A00000 / 0xA9B00000 / 0xA9C00000
  *   MDP        0xAA200000
  *   MDDI PMDH  0xAA600000
@@ -53,6 +54,7 @@
 #include "../htcleo/htcleo.h"
 #include "../htcleo/msm_regfile.h"
 #include "msm_mddi.h"
+#include "../htcleo/msm_modem.h"
 
 #define DREAM_SMI_BASE          0x00000000
 #define DREAM_SMI_SIZE          (64 * MiB)
@@ -64,6 +66,7 @@
 #define DREAM_GPIO1_PHYS        0xA9200000
 #define DREAM_GPIO2_PHYS        0xA9300000
 #define DREAM_DMOV_PHYS         0xA9700000
+#define DREAM_I2C_PHYS          0xA9900000
 #define DREAM_UART1_PHYS        0xA9A00000
 #define DREAM_UART2_PHYS        0xA9B00000
 #define DREAM_UART3_PHYS        0xA9C00000
@@ -71,8 +74,10 @@
 #define DREAM_PMDH_PHYS         0xAA600000
 #define DREAM_VIC_PHYS          0xC0000000
 #define DREAM_CSR_PHYS          0xC0100000
+#define DREAM_SMEM_PHYS         0x01F00000      /* inside SMI */
 
 /* MSM7x01A VIC lines (arch/arm/mach-msm/include/mach/irqs.h) */
+#define DREAM_INT_A9_M2A_0          0       /* ..6: modem -> apps */
 #define DREAM_INT_GP_TIMER_EXP      7
 #define DREAM_INT_DEBUG_TIMER_EXP   8
 #define DREAM_INT_UART1             9
@@ -81,20 +86,30 @@
 #define DREAM_INT_MDDI_PRI          16
 #define DREAM_INT_MDP               19
 #define DREAM_INT_ADM_AARM          21
+#define DREAM_INT_ADSP_A11          22
 #define DREAM_INT_GPIO_GROUP1       32
 #define DREAM_INT_GPIO_GROUP2       33
+#define DREAM_INT_PWB_I2C           34
 #define DREAM_INT_NAND_WR_ER_DONE   36
 #define DREAM_INT_NAND_OP_DONE      37
+
+#define DREAM_GPIO_CPLD_INT     17
 
 /* K9K2G08: maker 0xEC, device 0xAA, 2 KiB pages, 128 KiB blocks, x8 */
 #define DREAM_NAND_ID           0x1500AAECu
 #define DREAM_NAND_BLOCKS       2048
 
+/* SMEM as AMSS leaves it when it releases the apps core */
+static void dream_modem_reset(void *opaque)
+{
+    msm_modem_boot(MSM_MODEM(opaque));
+}
+
 static void dream_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *smi = g_new(MemoryRegion, 1);
-    DeviceState *vic, *dev;
+    DeviceState *vic, *csr, *modem, *dev;
     SysBusDevice *sbd;
     Object *cpuobj;
     ARMCPU *cpu;
@@ -145,7 +160,7 @@ static void dream_init(MachineState *machine)
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_IRQ));
     sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_FIQ));
 
-    dev = qdev_new(TYPE_MSM_CSR);
+    csr = dev = qdev_new(TYPE_MSM_CSR);
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, DREAM_CSR_PHYS);
@@ -153,13 +168,53 @@ static void dream_init(MachineState *machine)
     sysbus_connect_irq(sbd, 1,
                        qdev_get_gpio_in(vic, DREAM_INT_DEBUG_TIMER_EXP));
 
+    /*
+     * The modem: msm-modem plays AMSS's side of proc_comm, SMSM and SMD.
+     * The 2.6.25 trout kernel uses the same SMEM layout as the HD2's
+     * (proc_comm at +0, heap info +0xC0, TOC +0xD0); on the Dream it sits
+     * at SMI 0x01F00000, right above AMSS's own SMI image (0x00A00000-
+     * 0x01E5C000, see docs/dream-modem.md).  No HD2 SMEM image is loaded:
+     * with smd-v1 the model builds the heap the 2.6.25 kernel looks for
+     * and speaks its inline-FIFO SMD channels.
+     */
+    modem = qdev_new(TYPE_MSM_MODEM);
+    qdev_prop_set_bit(modem, "amss-hook", false);
+    qdev_prop_set_bit(modem, "smd-v1", true);
+    msm_csr_set_modem(csr, modem);
+    object_property_add_child(OBJECT(machine), "modem", OBJECT(modem));
+    qdev_realize_and_unref(modem, NULL, &error_fatal);
+    msm_modem_set_smem(MSM_MODEM(modem),
+                       (uint8_t *)memory_region_get_ram_ptr(smi) +
+                       DREAM_SMEM_PHYS);
+    for (int i = 0; i < 7; i++) {
+        qdev_connect_gpio_out_named(modem, "m2a", i,
+                                    qdev_get_gpio_in(vic, DREAM_INT_A9_M2A_0 + i));
+    }
+    /* apps -> modem doorbells (CSR +0x400 + 4n): proc_comm is n = 6 */
+    for (int i = 0; i < 16; i++) {
+        qdev_connect_gpio_out_named(csr, "a2m", i,
+                                    qdev_get_gpio_in_named(modem, "a2m", i));
+    }
+    qdev_connect_gpio_out_named(modem, "m2a", M2A_DSP,
+                                qdev_get_gpio_in(vic, DREAM_INT_ADSP_A11));
+    qemu_register_reset(dream_modem_reset, modem);
+
     dev = qdev_new(TYPE_MSM_GPIO);
+    qdev_prop_set_bit(dev, "msm7x01a", true);
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, DREAM_GPIO1_PHYS);
     sysbus_mmio_map(sbd, 1, DREAM_GPIO2_PHYS);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_GPIO_GROUP1));
     sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(vic, DREAM_INT_GPIO_GROUP2));
+    /*
+     * GPIO 17 is the trout CPLD's interrupt output: active high (the kernel
+     * sets POS=1 on bank 1 bit 1), held low by the CPLD while nothing is
+     * pending.  Left floating high it stormed trout_gpio_irq_handler
+     * (measured: 1.69M POS/CLEAR pairs in 25 s, boot stuck after
+     * "cpld_usb_hw2_sw").
+     */
+    msm_gpio_set_input((MsmGpioState *)dev, DREAM_GPIO_CPLD_INT, 0);
 
     /* UART1 is the SPL/kernel console (serial0); UART3 the trout debug port */
     for (int i = 0; i < 3; i++) {
@@ -194,6 +249,17 @@ static void dream_init(MachineState *machine)
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_NAND_OP_DONE));
     sysbus_connect_irq(sbd, 1,
                        qdev_get_gpio_in(vic, DREAM_INT_NAND_WR_ER_DONE));
+
+    /*
+     * I2C: no slaves yet (the trout touchscreen at 0x20, compass, ...),
+     * so probes NACK at once.  Unmapped, every transfer timed out (the
+     * synaptics probe alone took ~0.3 s of guest time).
+     */
+    dev = qdev_new(TYPE_MSM_I2C);
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, DREAM_I2C_PHYS);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_PWB_I2C));
 
     dev = qdev_new(TYPE_MSM_MDP);
     sbd = SYS_BUS_DEVICE(dev);

@@ -41,8 +41,11 @@ struct MsmModemState {
     bool clk_regime_fake;   /* answer clock regime proc_comm here (LLE test) */
     uint32_t boot_reason;
     bool trace;
+    bool smd_v1;            /* 2.6.25 SMD: inline FIFOs; builds SMEM */
+    bool amss_hook;         /* plant the HD2 AMSS hook MAGLDR patches */
     qemu_irq m2a[M2A_NUM];
     QEMUTimer *wake_timer;
+    QEMUTimer *v1_timer;        /* smd-v1: SMSM time-sync watch */
     QEMUTimer *park_timer;      /* watches MAGLDR's modem mailbox */
     QEMUTimer *q6_timer;        /* qdsp6-only: waits for AMSS's SMEM */
     bool qdsp6_only;            /* baseband=lle: only play the QDSP6 */

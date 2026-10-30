@@ -45,6 +45,7 @@
 #define SMEM_SMD_BASE_ID            14
 #define SMEM_SMEM_SLOW_CLOCK_VALUE  83
 #define SMEM_SMSM_SHARED_STATE      85
+#define SMEM_SMSM_INT_INFO          86
 #define SMEM_SMSM_SLEEP_DELAY       87
 #define SMEM_APPS_DEM_SLAVE_DATA    334
 #define SMEM_SMD_FIFO_BASE_ID       338
@@ -101,6 +102,7 @@
 #define SMSM_RPCINIT        0x00000020
 #define SMSM_RESET          0x00000040
 #define SMSM_RUN            0x00000100
+#define SMSM_V1_TIMEWAIT    0x00000400  /* 2.6.25 apps time request */
 #define SMSM_SYSTEM_REBOOT  0x00080000
 #define SMSM_SYSTEM_POWER_DOWN 0x00040000
 
@@ -159,6 +161,7 @@ enum {
 #define HC_TAIL     12
 #define HC_HEAD     16
 #define HC_SIZE     20
+#define SMD_V1_BUF  8192        /* 2.6.25 SMD_BUF_SIZE, FIFO inline */
 
 /* ------------------------------------------------------------------ */
 /* SMEM accessors                                                      */
@@ -210,7 +213,25 @@ static void m2a(MsmModemState *s, int n)
 static uint32_t smsm_off(MsmModemState *s, int item)
 {
     uint32_t size, off = smem_item(s, SMEM_SMSM_SHARED_STATE, &size);
-    if (!off || (unsigned)item * 4 >= size) {
+    if (!off) {
+        return 0;
+    }
+    if (s->smd_v1) {
+        /*
+         * 2.6.25: struct smsm_shared { host; state; } [2], apps first
+         * (measured: the kernel OR'd its bits into +4 and read the modem
+         * at +12).  No DEM words.
+         */
+        switch (item) {
+        case SMSM_STATE_APPS:
+            return off + 4;
+        case SMSM_STATE_MODEM:
+            return off + 12;
+        default:
+            return 0;
+        }
+    }
+    if ((unsigned)item * 4 >= size) {
         return 0;
     }
     return off + item * 4;
@@ -236,6 +257,36 @@ static void modem_wake_apps(void *opaque)
 
     /* The apps CPU waits for INT_A9_M2A_6 to come out of power collapse */
     m2a(s, 6);
+}
+
+static void smsm_v1_clock(MsmModemState *s)
+{
+    uint32_t clk = smem_item(s, SMEM_SMEM_SLOW_CLOCK_VALUE, NULL);
+    uint32_t apps = smsm_get(s, SMSM_STATE_APPS);
+
+    if (clk) {
+        uint64_t sclk = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                 32768, NANOSECONDS_PER_SECOND);
+        smem_wr(s, clk, (apps & SMSM_V1_TIMEWAIT) ? (uint32_t)sclk | 1 : 0);
+    }
+}
+
+/*
+ * The 2.6.25 kernel raises TIMEWAIT and spins without the doorbell
+ * reaching us first (measured: "timeout state 12b clock 0", the value
+ * appearing only at the exit step), so watch the apps word as well.
+ */
+#define SMSM_V1_POLL_NS 500000
+
+static void smsm_v1_poll(void *opaque)
+{
+    MsmModemState *s = opaque;
+
+    if (s->smem) {
+        smsm_v1_clock(s);
+    }
+    timer_mod(s->v1_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              SMSM_V1_POLL_NS);
 }
 
 static void smsm_handle(MsmModemState *s)
@@ -291,6 +342,21 @@ static void smsm_handle(MsmModemState *s)
         master |= DEM_MASTER_RUN;
         master &= ~(DEM_MASTER_RSA | DEM_MASTER_SLEEP | DEM_MASTER_SLEEP_EXIT);
         timer_del(s->wake_timer);
+    }
+
+    /*
+     * 2.6.25 (smd-v1) time sync, as get_smem_clock() drives it: the
+     * value must read 0 at the start ("invalid start state" otherwise),
+     * the apps set SMSM_TIMEWAIT (0x400) and spin until it is non-zero,
+     * then swap it for SMSM_TIMEINIT (0x800) and wait for 0 again
+     * (read from the trout vmlinux: smsm_change_state(0x400, 0x800) at
+     * 0xC002B0C0, then a loop until the value is 0).  So: the 32.768 kHz count while TIMEWAIT is up, 0 otherwise.
+     */
+    if (s->smd_v1) {
+        smsm_v1_clock(s);
+        if (s->trace) {
+            qemu_log("modem: SMSM apps 0x%08x\n", apps);
+        }
     }
 
     /* Time master: serve slow-clock requests (timer.c, N-way variant) */
@@ -624,16 +690,32 @@ static bool smd_channel(MsmModemState *s, int n, SmdChan *c)
     c->cid = smem_rd(s, e + 20);
     c->ctype = smem_rd(s, e + 24);
     c->shared = smem_item(s, SMEM_SMD_BASE_ID + c->cid, NULL);
-    c->fifo = smem_item(s, SMEM_SMD_FIFO_BASE_ID + c->cid, &fsize);
-    if (!c->shared || !c->fifo || (fsize & (fsize - 1))) {
-        return false;
+    if (s->smd_v1) {
+        /*
+         * 2.6.25 (trout): one item per channel, each half channel's FIFO
+         * inline after its 20-byte header: [ch0][8K][ch1][8K].
+         */
+        if (!c->shared) {
+            return false;
+        }
+        c->fifo_size = SMD_V1_BUF;
+        c->apps = c->shared;
+        c->apps_data = c->shared + HC_SIZE;
+        c->modem = c->apps_data + SMD_V1_BUF;
+        c->modem_data = c->modem + HC_SIZE;
+        c->fifo = c->apps_data;
+    } else {
+        c->fifo = smem_item(s, SMEM_SMD_FIFO_BASE_ID + c->cid, &fsize);
+        if (!c->shared || !c->fifo || (fsize & (fsize - 1))) {
+            return false;
+        }
+        c->fifo_size = fsize / 2;
+        /* apps writes ch0 / data[0..size), modem writes ch1 / data[size..) */
+        c->apps = c->shared;
+        c->modem = c->shared + HC_SIZE;
+        c->apps_data = c->fifo;
+        c->modem_data = c->fifo + c->fifo_size;
     }
-    c->fifo_size = fsize / 2;
-    /* apps writes ch0 / data[0..size), modem writes ch1 / data[size..) */
-    c->apps = c->shared;
-    c->modem = c->shared + HC_SIZE;
-    c->apps_data = c->fifo;
-    c->modem_data = c->fifo + c->fifo_size;
     /* same rule as smd_is_packet(): unknown kind -> packet if cid>4 or 1 */
     switch (c->ctype & SMD_KIND_MASK) {
     case SMD_KIND_PACKET:
@@ -912,6 +994,70 @@ void msm_modem_set_smem(MsmModemState *s, uint8_t *smem)
     s->smem = smem;
 }
 
+/*
+ * smd-v1 without an SMEM image: lay the heap out the way AMSS does before
+ * it releases the apps core, with the items the 2.6.25 trout kernel looks
+ * up (smd_core_init, smd_channel_probe_worker, smsm, the slow clock).
+ * Measured need: with an empty heap the kernel printed "<SM NO STATE>",
+ * "no smem clock" and oopsed in smd_channel_probe_worker on a NULL
+ * ID_CH_ALLOC_TBL.  Sizes are the ones the kernel checks (smem_find
+ * prints "wrong size" otherwise: SMSM state is 16 bytes).  Names are
+ * stored bare; the kernel prepends "SMD_".  Channel cids are the stock
+ * modem's; ctype 0
+ * leaves stream/packet to smd_is_packet()'s cid rule, as on the phone.
+ */
+#define SMEM_HEAP_TOC_ENTRIES   128
+#define SMEM_HEAP_START         0x1000
+
+static uint32_t smem_build_alloc(MsmModemState *s, unsigned id, uint32_t size,
+                                 uint32_t *next)
+{
+    uint32_t off = *next, e = 0xD0 + id * 16;
+
+    size = ROUND_UP(size, 8);
+    if (id >= SMEM_HEAP_TOC_ENTRIES || off + size > MSM_SHARED_RAM_SIZE) {
+        return 0;
+    }
+    memset(s->smem + off, 0, size);
+    smem_wr(s, e, 1);
+    smem_wr(s, e + 4, off);
+    smem_wr(s, e + 8, size);
+    smem_wr(s, e + 12, 0);
+    *next = off + size;
+    return off;
+}
+
+static void smem_build_v1(MsmModemState *s)
+{
+    static const struct { int cid; const char *name; } chans[] = {
+        { 0, "DS" }, { 1, "DIAG" }, { 2, "RPCCALL" },
+    };
+    uint32_t next = SMEM_HEAP_START, tbl;
+
+    memset(s->smem, 0, SMEM_HEAP_START);
+    tbl = smem_build_alloc(s, SMEM_CHANNEL_ALLOC_TBL, SMD_NUM_CH * 32, &next);
+    for (int i = 0; i < ARRAY_SIZE(chans); i++) {
+        uint32_t e = tbl + i * 32;
+
+        pstrcpy((char *)s->smem + e, 20, chans[i].name);
+        smem_wr(s, e + 20, chans[i].cid);
+        smem_wr(s, e + 24, 0);
+        smem_wr(s, e + 28, 1);
+        smem_build_alloc(s, SMEM_SMD_BASE_ID + chans[i].cid,
+                         2 * (HC_SIZE + SMD_V1_BUF), &next);
+    }
+    smem_build_alloc(s, SMEM_SMEM_SLOW_CLOCK_VALUE, 4, &next);
+    smem_build_alloc(s, SMEM_SMSM_SHARED_STATE, 4 * 4, &next);
+    smem_build_alloc(s, SMEM_SMSM_SLEEP_DELAY, 4, &next);
+    /* aArm_en_mask, aArm_interrupts_pending, aArm_wakeup_reason */
+    smem_build_alloc(s, SMEM_SMSM_INT_INFO, 3 * 4, &next);
+    /* heap info: initialized, free offset, remaining, reserved */
+    smem_wr(s, SMEM_HEAP_INFO_OFF, 1);
+    smem_wr(s, SMEM_HEAP_INFO_OFF + 4, next);
+    smem_wr(s, SMEM_HEAP_INFO_OFF + 8, MSM_SHARED_RAM_SIZE - next);
+    smem_wr(s, SMEM_HEAP_INFO_OFF + 12, 0);
+}
+
 /* Bring SMEM to the state AMSS leaves it in when it hands over to Linux */
 void msm_modem_boot(MsmModemState *s)
 {
@@ -931,10 +1077,17 @@ void msm_modem_boot(MsmModemState *s)
                          s->smem_image, err->message);
             g_error_free(err);
         }
+    } else if (s->smd_v1) {
+        smem_build_v1(s);
+        timer_mod(s->v1_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  SMSM_V1_POLL_NS);
     }
 
     s->taken_over = false;
-    physical_memory_write(AMSS_HOOK_PA, amss_hook_fn, sizeof(amss_hook_fn));
+    /* the HD2's AMSS function MAGLDR hijacks; nothing like it on the Dream */
+    if (s->amss_hook) {
+        physical_memory_write(AMSS_HOOK_PA, amss_hook_fn, sizeof(amss_hook_fn));
+    }
 
     /* proc_comm: modem idle and ready */
     smem_wr(s, 0x00, PCOM_CMD_IDLE);
@@ -1103,6 +1256,7 @@ static void modem_realize(DeviceState *dev, Error **errp)
     s->wake_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, modem_wake_apps, s);
     s->park_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, modem_park_poll, s);
     s->q6_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, q6_poll, s);
+    s->v1_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, smsm_v1_poll, s);
     msm_modem_rpc_init(s);
     msm_atmodem_init(s);
     msm_gps_init(s);
@@ -1125,6 +1279,8 @@ static const Property modem_props[] = {
     DEFINE_PROP_BOOL("clk-regime-fake", MsmModemState, clk_regime_fake, false),
     DEFINE_PROP_UINT32("boot-reason", MsmModemState, boot_reason, 1),
     DEFINE_PROP_BOOL("trace", MsmModemState, trace, false),
+    DEFINE_PROP_BOOL("amss-hook", MsmModemState, amss_hook, true),
+    DEFINE_PROP_BOOL("smd-v1", MsmModemState, smd_v1, false),
     DEFINE_AUDIO_PROPERTIES(MsmModemState, audio_be),
     DEFINE_NIC_PROPERTIES(MsmModemState, nic_conf),
     /* where the emulated GPS receiver finds itself (degrees, metres) */

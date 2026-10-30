@@ -18,6 +18,7 @@
  */
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "hw/core/qdev-properties.h"
 #include "qemu/module.h"
 #include "htcleo.h"
 
@@ -42,6 +43,21 @@ static const GpioBank banks[NUM_BANKS] = {
     { 153, 164, 0, 0x18, 0x38, 0x68, 0x88, 0xA8, 0xC8, 0xE8, 0x108 },
 };
 
+/*
+ * MSM7x01A (the Dream): five banks, pins 0-106, from the 2.6.25 trout
+ * kernel's arch/arm/mach-msm/gpio_hw.h as recalled, not yet checked
+ * against a disassembly.  GPIO1's banks interleave by 4 from OUT 0x00,
+ * OE 0x10, IN 0x34, EDGE 0x60, POS 0x70, EN 0x80, CLEAR 0x90,
+ * STATUS 0xA0; bank 1 (GPIO2) has the same layout as on the QSD8x50.
+ */
+static const GpioBank banks_7x01a[] = {
+    {   0,  15, 0, 0x00, 0x10, 0x34, 0x60, 0x70, 0x80, 0x90, 0xA0 },
+    {  16,  42, 1, 0x00, 0x08, 0x20, 0x50, 0x58, 0x60, 0x68, 0x70 },
+    {  43,  67, 0, 0x04, 0x14, 0x38, 0x64, 0x74, 0x84, 0x94, 0xA4 },
+    {  68,  94, 0, 0x08, 0x18, 0x3C, 0x68, 0x78, 0x88, 0x98, 0xA8 },
+    {  95, 106, 0, 0x0C, 0x1C, 0x40, 0x6C, 0x7C, 0x8C, 0x9C, 0xAC },
+};
+
 #define PROC_APPS   0
 #define PROC_MODEM  1
 
@@ -63,6 +79,11 @@ struct MsmGpioState {
 
     MsmGpioOutputNotify notify;
     void *notify_opaque;
+
+    bool msm7x01a;                  /* bank layout: Dream instead of HD2 */
+    bool trace;                     /* log guest register writes */
+    const GpioBank *banks;
+    int nbanks;
 };
 
 static uint32_t bank_in(MsmGpioState *s, int b)
@@ -83,7 +104,7 @@ static void gpio_update(MsmGpioState *s)
         GpioIrqState *p = &s->pi[proc];
         bool grp[2] = { false, false };
 
-        for (int b = 0; b < NUM_BANKS; b++) {
+        for (int b = 0; b < s->nbanks; b++) {
             uint32_t in = bank_in(s, b);
             uint32_t chg = in ^ p->last_in[b];
             uint32_t rise = chg & in, fall = chg & ~in;
@@ -92,7 +113,7 @@ static void gpio_update(MsmGpioState *s)
                            p->edge[b];
             p->last_in[b] = in;
             if (bank_status(s, p, b) & p->en[b]) {
-                grp[banks[b].block] = true;
+                grp[s->banks[b].block] = true;
             }
         }
         qemu_set_irq(s->irq[2 * proc], grp[0]);
@@ -100,11 +121,11 @@ static void gpio_update(MsmGpioState *s)
     }
 }
 
-static int pin_bank(int pin, int *bit)
+static int pin_bank(MsmGpioState *s, int pin, int *bit)
 {
-    for (int b = 0; b < NUM_BANKS; b++) {
-        if (pin >= banks[b].first && pin <= banks[b].last) {
-            *bit = pin - banks[b].first;
+    for (int b = 0; b < s->nbanks; b++) {
+        if (pin >= s->banks[b].first && pin <= s->banks[b].last) {
+            *bit = pin - s->banks[b].first;
             return b;
         }
     }
@@ -113,7 +134,7 @@ static int pin_bank(int pin, int *bit)
 
 void msm_gpio_set_input(MsmGpioState *s, int pin, int level)
 {
-    int bit, b = pin_bank(pin, &bit);
+    int bit, b = pin_bank(s, pin, &bit);
 
     if (b < 0) {
         return;
@@ -128,7 +149,7 @@ void msm_gpio_set_input(MsmGpioState *s, int pin, int level)
 
 int msm_gpio_get_output(MsmGpioState *s, int pin)
 {
-    int bit, b = pin_bank(pin, &bit);
+    int bit, b = pin_bank(s, pin, &bit);
 
     if (b < 0) {
         return -1;
@@ -141,7 +162,7 @@ int msm_gpio_get_output(MsmGpioState *s, int pin)
 
 int msm_gpio_get_output_latch(MsmGpioState *s, int pin)
 {
-    int bit, b = pin_bank(pin, &bit);
+    int bit, b = pin_bank(s, pin, &bit);
 
     return b < 0 ? -1 : (s->out[b] >> bit) & 1;
 }
@@ -162,9 +183,9 @@ static void notify_changes(MsmGpioState *s, int b, uint32_t before)
         return;
     }
     /* Report every pin whose driven state changed, including OE flips */
-    for (int i = 0; i <= banks[b].last - banks[b].first; i++) {
+    for (int i = 0; i <= s->banks[b].last - s->banks[b].first; i++) {
         if (chg & (1u << i)) {
-            s->notify(s->notify_opaque, banks[b].first + i,
+            s->notify(s->notify_opaque, s->banks[b].first + i,
                       (after >> i) & 1);
         }
     }
@@ -185,25 +206,25 @@ static uint64_t gpio_read(MsmGpioState *s, int proc, int block, hwaddr off)
 
     if (off >= base && off < base + 0x110) {
         hwaddr r = off - base;
-        for (int b = 0; b < NUM_BANKS; b++) {
-            if (banks[b].block != block) {
+        for (int b = 0; b < s->nbanks; b++) {
+            if (s->banks[b].block != block) {
                 continue;
             }
-            if (r == banks[b].out) {
+            if (r == s->banks[b].out) {
                 return s->out[b];
-            } else if (r == banks[b].oe) {
+            } else if (r == s->banks[b].oe) {
                 return s->oe[b];
-            } else if (r == banks[b].in) {
+            } else if (r == s->banks[b].in) {
                 return bank_in(s, b);
-            } else if (r == banks[b].edge) {
+            } else if (r == s->banks[b].edge) {
                 return p->edge[b];
-            } else if (r == banks[b].pos) {
+            } else if (r == s->banks[b].pos) {
                 return p->pos[b];
-            } else if (r == banks[b].en) {
+            } else if (r == s->banks[b].en) {
                 return p->en[b];
-            } else if (r == banks[b].status) {
+            } else if (r == s->banks[b].status) {
                 return bank_status(s, p, b);
-            } else if (r == banks[b].clr) {
+            } else if (r == s->banks[b].clr) {
                 return 0;
             }
         }
@@ -217,27 +238,31 @@ static void gpio_write(MsmGpioState *s, int proc, int block, hwaddr off,
     GpioIrqState *p = &s->pi[proc];
     hwaddr base = bank_base(proc, block);
 
+    if (s->trace) {
+        qemu_log("msm-gpio: %s GPIO%d +0x%03" HWADDR_PRIx " = 0x%08x\n",
+                 proc == PROC_APPS ? "apps" : "modem", block + 1, off, val);
+    }
     if (off >= base && off < base + 0x110) {
         hwaddr r = off - base;
-        for (int b = 0; b < NUM_BANKS; b++) {
+        for (int b = 0; b < s->nbanks; b++) {
             uint32_t before;
-            if (banks[b].block != block) {
+            if (s->banks[b].block != block) {
                 continue;
             }
             before = bank_in(s, b);
-            if (r == banks[b].out) {
+            if (r == s->banks[b].out) {
                 s->out[b] = val;
                 notify_changes(s, b, before);
-            } else if (r == banks[b].oe) {
+            } else if (r == s->banks[b].oe) {
                 s->oe[b] = val;
                 notify_changes(s, b, before);
-            } else if (r == banks[b].edge) {
+            } else if (r == s->banks[b].edge) {
                 p->edge[b] = val;
-            } else if (r == banks[b].pos) {
+            } else if (r == s->banks[b].pos) {
                 p->pos[b] = val;
-            } else if (r == banks[b].en) {
+            } else if (r == s->banks[b].en) {
                 p->en[b] = val;
-            } else if (r == banks[b].clr) {
+            } else if (r == s->banks[b].clr) {
                 p->latch[b] &= ~val;
             } else {
                 continue;
@@ -277,12 +302,12 @@ static void gpio_reset(DeviceState *dev)
 {
     MsmGpioState *s = MSM_GPIO(dev);
 
-    for (int b = 0; b < NUM_BANKS; b++) {
+    for (int b = 0; b < s->nbanks; b++) {
         s->out[b] = s->oe[b] = 0;
     }
     memset(s->pi, 0, sizeof(s->pi));
     for (int proc = 0; proc < 2; proc++) {
-        for (int b = 0; b < NUM_BANKS; b++) {
+        for (int b = 0; b < s->nbanks; b++) {
             s->pi[proc].last_in[b] = bank_in(s, b);
         }
     }
@@ -312,10 +337,25 @@ static void gpio_init(Object *obj)
     }
 }
 
+static void gpio_realize(DeviceState *dev, Error **errp)
+{
+    MsmGpioState *s = MSM_GPIO(dev);
+
+    s->banks = s->msm7x01a ? banks_7x01a : banks;
+    s->nbanks = s->msm7x01a ? ARRAY_SIZE(banks_7x01a) : ARRAY_SIZE(banks);
+}
+
+static const Property gpio_props[] = {
+    DEFINE_PROP_BOOL("msm7x01a", MsmGpioState, msm7x01a, false),
+    DEFINE_PROP_BOOL("trace", MsmGpioState, trace, false),
+};
+
 static void gpio_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     device_class_set_legacy_reset(dc, gpio_reset);
+    device_class_set_props(dc, gpio_props);
+    dc->realize = gpio_realize;
 }
 
 static const TypeInfo msm_gpio_info = {
