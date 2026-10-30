@@ -83,6 +83,33 @@ or the mouse wheel (vertical), press with the middle button or F10.
 Measured: tapping the android, the tip and "Next" walks the setup wizard
 to its account page; trackball Down + press opens the Emergency Dialer.
 
+### Past the setup wizard
+
+RC29's wizard needs a Google account to continue, so an offline image is
+stuck at "Welcome to T-Mobile G1". The wizard gates on the Settings
+`device_provisioned` flag in `/data`, so flip it offline and the next boot
+goes to the home screen. `/data` is empty in a fresh image, so the
+settings database only exists after one boot:
+
+```bash
+cp images/dream_nand_boot.img images/dream_data.img          # a working copy
+src/qemu/build/qemu-system-arm -M dream -bios spl.bin \
+    -drive if=mtd,format=raw,file=images/dream_data.img       # no snapshot
+#   ... let it reach the wizard (~30 s), then power off ...
+python3 tools/yaffs.py images/dream_data.img set-provisioned  # device_provisioned=1
+src/qemu/build/qemu-system-arm -M dream -bios spl.bin \
+    -drive if=mtd,format=raw,file=images/dream_data.img,snapshot=on -display sdl
+```
+
+`tools/yaffs.py` reads and edits the YAFFS2 filesystems in the image
+(`--part system|cache|userdata`): `list`, `extract PATH OUT`, and
+`replace PATH IN` (same size or smaller, rewriting data in place and
+keeping each chunk's spare). `set-provisioned` extracts `settings.db`,
+sets `device_provisioned` (and `install_non_market_apps`) with the `sqlite3`
+module, and writes it back. It does not recompute data-area ECC — the
+msm-nand model treats parity as zero and never checks it, so edits read
+back verbatim in the emulator but would fail a real controller.
+
 ## Buttons, HBOOT and recovery keys
 
 `-M dream,keys=power+back` holds a combo from power-on (3 s): the SPL
