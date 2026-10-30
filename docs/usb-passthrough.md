@@ -1,0 +1,428 @@
+# USB passthrough: the emulated HD2 on the phone's own USB port
+
+Status and findings, for picking this up again. Everything below was measured on
+an S25 (SM-S931B, Snapdragon 8 elite, `6.6.127-android15-8`, rooted with
+KernelSU), not assumed.
+
+## What this is
+
+With passthrough on, the S25's USB port stops being the S25 and becomes the
+emulated HTC HD2: a PC plugged into the phone sees an HD2 and its `adb`,
+`fastboot` and flashers talk to the emulated one.
+
+    PC  <--USB-->  S25's UDC (hw)  <--FunctionFS-->  usbffs  <--USB/IP socket-->  QEMU
+                                                              (the HD2's gadget)
+
+* **QEMU side (done).** `-M htcleo,usb-host=lle,usb-ip-socket=PATH` speaks the
+  same USB/IP stream vhci_hcd would have spoken, on a unix socket. QEMU listens,
+  the bridge connects. No root, no `vhci_hcd`.
+  Files: `htcleo_usbip.c` (listen/accept, plus re-listening when the peer goes
+  away), `msm_hsusb.c` (`usb-ip-socket` property), `htcleo.c` (`usb-host=socket`,
+  `usb-ip-socket`).
+* **Bridge side (`android/native/usbffs.c`; works, see "Verified end to
+  end").** Runs as root, walks the emulated gadget for its descriptors over
+  USB/IP, sets up a configfs + FunctionFS gadget, binds the UDC, and proxies
+  every transfer.
+* **App side (done).** A switch in Root & USB (`Config.usbPassthrough`), which
+  adds `usb-ip-socket=` and `usb-host=lle` to the machine line and starts
+  `usbffs` as root (`Emulator.launch()`). With passthrough on it also *does not*
+  press the boot keys: the PC is the thing talking to the emulated phone, and
+  fastboot is the bootloader itself (see "The guest stays in the bootloader").
+
+### Running it by hand (what the app will do)
+
+```sh
+# on the phone, as root
+qemu-system-arm -M htcleo,usb-host=lle,usb-ip-socket=/data/local/tmp/usbip.sock \
+    -drive if=mtd,format=raw,file=<nand.img> \
+    -display none -serial file:/data/local/tmp/uart1.log \
+    -qmp unix:/data/local/tmp/qmp.sock,server=on,wait=off \
+    -d unimp,guest_errors &
+usbffs --usbip /data/local/tmp/usbip.sock --pidfile /data/local/tmp/usbffs.pid \
+    --verbose &
+```
+
+`usbffs` takes the UDC when it is up (about 30 s in: QEMU has to boot the
+guest first) and gives it back on SIGTERM, restarting `vendor.usb-hal`.
+`--selftest` makes it try the descriptor write four ways and print what the
+driver says, which is the quickest way to tell a blob problem from a state
+problem.
+
+## Finding and stopping the bridge
+
+**The process name is not `usbffs`.** The app ships it in the APK as
+`libhtcleo-usbffs.so` and runs it out of `nativeLibraryDir`, so on the phone it
+is a process called `libhtcleo-usbffs.so`:
+
+```
+$ pidof usbffs                       # nothing
+$ pidof libhtcleo-usbffs.so          # 11189 12573
+```
+
+Every `pkill -x usbffs` therefore matched nothing, and the app's stop -- which
+every start calls first -- silently did nothing. Two bridges ended up on the UDC
+at once, each taking the port from the other, with `vendor.usb-hal` left stopped
+and `hd2` still bound: the phone's own USB dead, and the next start refused with
+`max_speed: Invalid argument` because the driver will not take `max_speed` on a
+gadget that is bound.
+
+So the bridge writes its pid where the app can read it (`--pidfile`), stops any
+bridge named there before starting (`the last bridge (pid N) is still running;
+stopping it first`), and takes its own name off the pidfile on the way out. The
+app signals that pid. A pidfile is not a workaround for the name: it is the only
+reliable handle on a process started through a root shell that is long gone by
+the time anything wants to stop it.
+
+## The guest stays in the bootloader
+
+With passthrough on, the app skips the boot keys it otherwise sends to get past
+the cLK menu and boot Android. The PC on the other end of the cable is the thing
+talking to the emulated phone, and fastboot *is* the bootloader: pressing on
+would boot Android and the PC would find nothing to talk to. This is the same
+choice `tools/start.sh` makes with `CLK_KEYS=pressed nothing`.
+
+## Getting the bridge stopped takes unbinding first
+
+This ffs blocks inside `read(2)` even on an fd opened `O_NONBLOCK` -- it waits
+there for the UDC to queue more, so a worker caught by one when the port goes
+away stays in the kernel (`wchan=ffs_epfile_io`, syscall `read` on ep2). Joining
+the workers before giving the UDC back is a bridge that hangs forever, taking the
+phone's USB down with it: `stopping` in the log and then nothing.
+
+So `teardown()` unbinds first and waits afterwards, with a five second deadline
+(Bionic has no timed join, so each worker says it is done on the way out) and
+without closing or freeing anything a stuck worker still owns. Stopping a
+working bridge takes about a second now, and the phone is left with the UDC free
+and `vendor.usb-hal` running.
+
+## vhci_hcd: not needed, and not there
+
+The other way round -- attach the emulated gadget to *this phone's* USB host
+stack -- is impossible here, and `UsbBridge.Probe.hostPossible()` should say so
+plainly rather than just reporting a missing directory:
+
+| | |
+|---|---|
+| `/sys/bus/platform/drivers/vhci_hcd` | does not exist |
+| `/sys/module/vhci_hcd` | does not exist |
+| `modprobe vhci_hcd` | fails: there is no `/lib/modules` at all |
+| `CONFIG_USB_VHCI_HCD` | not in `/proc/config.gz` (only `BT_HCIVHCI` is mentioned, which is Bluetooth) |
+
+So: passthrough is gadget mode, on this phone's own USB port. `hostPossible()`
+has been the wrong question all along; what the feature needs is `gadgetPossible()`
+(configfs + functionfs + a free UDC), all of which this phone has.
+
+## The FunctionFS descriptor blob
+
+The header is **host order** (`get_unaligned_le32`), and each per-speed field is
+a **descriptor count**, not a byte length:
+
+```c
+u32 magic   3        /* FUNCTIONFS_DESCRIPTORS_MAGIC_V2 */
+u32 length  93       /* the whole blob, including these 24 bytes */
+u32 flags   7        /* HAS_FS_DESC | HAS_HS_DESC | HAS_SS_DESC */
+u32 fs_count, hs_count, ss_count
+  fs blob | hs blob | ss blob     /* interface + endpoint descriptors ONLY */
+```
+
+then the strings as a second write: `magic 2, length, str_count, lang_count,
+0x0409, ...NUL-terminated UTF-8`.
+
+Four ways to get a bare `EINVAL` out of the `write()` to `ep0`, all of which look
+identical from userspace:
+
+1. **Byte order.** The header written big-endian (the way USB/IP headers go)
+   fails `get32(data + 4) != len` and nothing else. The interface and endpoint
+   descriptors inside the blobs are little-endian, as on the wire; only the
+   six header words are host order. Keep both writers in the bridge: `put32()`
+   for USB/IP frames, `put32le()` for these.
+2. **Counts are counts.** An adb interface is 3 descriptors (interface, ep IN,
+   ep OUT), so `3`, not `23`.
+3. **All three speeds must be present**, each with its own blob.
+4. **Writes must be at least 16 bytes**, so toybox `base64 -d > ep0` (which
+   dribbles the blob out in chunks) always fails.
+
+Interface and endpoint descriptors only: a device or configuration descriptor
+in the blob is rejected, because those come from the configfs attributes.
+`ffs_do_descs()` leaves `len` to be exactly consumed, so a count that does not
+cover the descriptors in its blob fails too.
+
+## High speed, and why not super speed
+
+The emulated HD2 hangs off an EHCI controller. Say so:
+
+```
+echo high-speed > /config/usb_gadget/<gadget>/max_speed
+```
+
+* the driver only accepts `high-speed`, not `high` (EINVAL for anything else);
+* it can only be written while the gadget is unbound;
+* the USB HAL puts `super-speed-plus` back on every gadget while it runs, so
+  this has to happen *after* `stop vendor.usb-hal`;
+* and it matters: at super speed the host insists on SS endpoint companion
+  descriptors that FunctionFS will not take, so `SET_CONFIGURATION` fails with
+  EPIPE and the interface never comes up at all. The host says so plainly:
+  `can't set config #1, error -32`.
+
+## Unbinding a gadget needs a newline
+
+`echo "" > .../UDC` unbinds. `write(fd, "", 0)` does **not** -- the kernel
+ignores a zero-length write (and reports EFAULT for it), the gadget stays bound,
+and the next bind gets EBUSY.
+
+## The emulated guest has to be told the host configured it
+
+This is the one that is not obvious. The phone's UDC answers the standard
+requests itself, out of the descriptor copy we gave it, so the host's
+`SET_CONFIGURATION` never reaches the emulated gadget. In cLK that request is
+what `handle_setup()` uses to enable the bulk endpoints and signal
+`UDC_EVENT_ONLINE`, which is what wakes the fastboot thread. Without it the
+emulated phone enumerates and then sits there mute: the guest's queue heads for
+the bulk endpoints are never primed, every bulk transfer on the host times out,
+and the UART shows `init_ui()` and then nothing at all (no
+`fastboot: processing commands`).
+
+So the bridge replays it, on the ffs `ENABLE` event, which is exactly the host
+selecting the configuration:
+
+```
+ffs: event type 2                        /* FUNCTIONFS_ENABLE */
+emu: <- replay SET_CONFIGURATION as seq 8
+```
+
+The answer goes nowhere: the UDC has already given the host its status stage and
+no SETUP is waiting on ep0 for it.
+
+## Verified end to end
+
+QEMU on the phone with `-M htcleo,usb-host=lle,usb-ip-socket=...`, the guest
+booted from the NAND (cLK, straight into fastboot), the bridge on top of
+FunctionFS, and the PC on the other end of the phone's own USB port:
+
+```
+$ lsusb | grep 18d1
+Bus 001 Device 013: ID 18d1:0d02 Google Inc. Celkon A88      (high speed, 480M)
+
+$ fastboot getvar version
+version: 0.5
+$ fastboot getvar product
+product: HTCLEO
+
+$ fastboot flash recovery HD2_TWRP_2.4.0.0-nanddump.img
+Sending 'recovery' (4856 KB)
+Writing 'recovery'                      OKAY [  0.001s]
+```
+
+with the guest's own UART agreeing:
+
+```
+fastboot: download:004be000
+fastboot: flash:recovery
+writing 4972544 bytes to 'recovery'
+flash_write_image: success
+partition 'recovery' updated
+```
+
+and the bytes verifiably in the emulated NAND: page 0x221 (the recovery
+partition in cLK's table) starts with `ANDROID!` and the image's cmdline.
+
+So: the phone's UDC serves the host, the host's URBs reach the emulated gadget,
+its answers come back, and writes land in the emulated flash.
+
+## Bugs this shook out of the bridge
+
+Each of these was a silent stall, not a crash:
+
+| Symptom | Cause |
+|---|---|
+| `EINVAL` on the ep0 write, same bytes fine from a shell | big-endian header (above) |
+| `can't set config #1, error -32` | super speed negotiated, no companions |
+| `EBUSY` on bind | the HAL's gadget was still bound; unbind with `"\n"` |
+| guest never serves fastboot | `SET_CONFIGURATION` not replayed (above) |
+| no bulk OUT ever moved | the OUT worker waited for `have`, which only a read sets -- deadlock before the first read |
+| whole bridge froze after the first wake-up | the wake pipe was blocking and the drain loop read it until EOF, which never comes |
+| 7-byte reply lost | `submit_urb()` zeroes the slot, and the submit loop ran before the answer was collected |
+| thousands of 0-byte transfers, guest printing empty commands | an OUT *answer* was announced as pending endpoint data, so the loop submitted an empty transfer to the emulator, completing the gadget's outstanding read as an empty command |
+| QEMU never listened again after the bridge exited | `usbip_service()` deleted the shared timer, cancelling the re-attach armed by `usbip_link_reset()` |
+| emulator read a SETUP on a bulk endpoint | stale stack bytes in the header's setup field; the frame needs zeroing, and the decoder must only believe it on ep0 (it already does) |
+| `max_speed: Invalid argument`, phone's USB dead | two bridges on the UDC at once (see above): `pkill -x usbffs` matched nothing, so the old one held the gadget and the driver refuses `max_speed` on a bound gadget |
+| the bridge used the phone's own `g1` after a reboot | `find_gadget()` fell back to any gadget with a UDC file; it now creates `hd2` first and only borrows one if that is refused |
+| `stopping` in the log, and the phone's USB never came back | workers joined before the UDC was released, and a worker inside this ffs's `read(2)` does not come out (above) |
+
+Still unexplained, and now visible rather than mysterious: **a large download
+stops after 4,915,200 bytes** (75 reads of 64 KB, every time) with the guest
+*alive and waiting* -- the emulated controller's ENDPTSTAT still has the bulk
+OUT request primed -- and the host still holding the rest. At that point:
+
+```
+$ sudo cat /sys/kernel/debug/usb/ehci/0000:00:1a.0/async
+qh/... dev5 fs ep2 00400205 41020000 (04048d82* data0 nak0)
+```
+
+`nak0` with `data0`: the phone's UDC is *acking* the host's packets and not
+handing them on. On the phone side the bridge is blocked in `read(2)` on the
+bulk OUT endpoint with nothing queued, and `pidof`/`/proc/<pid>/task/*/wchan`
+says `ffs_epfile_io` -- this driver waits for the UDC inside the read whether
+the fd is `O_NONBLOCK` or not (the fdinfo flags show `O_NONBLOCK` set and it
+blocks anyway), so the bridge cannot use "the phone went quiet" to mean "the
+host has finished sending".
+
+That is why the bridge does not guess: a piece is only ever sent unaligned when
+it is a *command* (at most 64 bytes into the guest's 64-byte buffer, where the
+short completion is the point), and the end of a download comes from the size
+the host announced in `download:00102800` rather than from a timeout. What this
+still needs is a way to ask the phone's dwc3 what it thinks its OUT request
+queue looks like -- there is no `/sys/class/udc/<udc>/ep*` and no
+`/sys/kernel/debug/usb/dwc3/` on this kernel.
+
+### What a transfer looks like, and why its pages have to stay whole
+
+cLK's fastboot reads a download in 4096-byte pieces (`usb_read()`:
+`xfer = (len > 4096) ? 4096 : len`) and reads a *short* request as the end of
+what it asked for:
+
+```c
+        count += req->length;
+        ...
+        /* short transfer? */
+        if (req->length != xfer) break;
+```
+
+then `cmd_download()` compares what it got with the announced size and puts
+itself into `STATE_ERROR`, which prints `fastboot: oops!` and stops serving
+fastboot entirely. The phone's UDC hands FunctionFS however much it had room
+for -- 65,363 bytes where the guest asked for 4096 is ordinary -- so passing
+those chunks straight through ends the guest's request short and a download
+dies at whatever page that lands on.
+
+So the bridge:
+
+* hands the emulator **whole 4096-byte pieces** (`ring_whole_pages()`), which
+  the guest then always sees complete;
+* sends a **command** unaligned after the phone has been quiet a moment,
+  because a command is 17-30 bytes into a 64-byte buffer and only the short
+  completion lets the guest see it at all;
+* finishes a **download** from the size the host announced: whatever is left
+  over, 4096 or less, is exactly the piece the guest's last request wants, so
+  it goes out the moment those bytes arrive -- nothing is guessed from a
+  timeout, because the phone's quiet periods are this driver's blocking reads
+  and not the host finishing;
+* copies out of the ring **wrapping** (`ring_copy_out()`): clipping to the end
+  of the buffer put a 3,881-byte transfer where a 4,096-byte one belonged, a
+  megabyte into the transfer. Fixing that alone took `fastboot flash` from
+  2,162,688 bytes to 4,915,200.
+
+### Reading the guest while it runs
+
+The bootloader in `images/nand-lle.img` is built with `WITH_DEBUG_UART=1` and
+`DEBUG=2`, so `dprintf(INFO, ...)` reaches UART1 (`files/emu/run/uart1.log`),
+which is the only way to see what the *guest* thinks while it is being flashed.
+`aboot_init()` also starts `usbwatch`, a thread that reads four controller
+registers and prints them **when they change** (plus a heartbeat), so a
+transfer's state is visible without a debugger:
+
+```
+[66710] usbwatch: stat 00000002 prime 00000000 complete 00000000 sts 00000000
+```
+
+`stat` bit 1 is the bulk OUT request the gadget has queued. Watching it turn to
+0 while the host is still sending says the guest has given up; watching it stay
+set says the guest is waiting and the phone is the side that has stopped.
+
+## The `-19` on bind
+
+`usb_gadget_start()` returns `-19` (`ENODEV`) if the ffs function is not
+`FFS_ACTIVE`, and `FFS_ACTIVE` only holds while **ep0 is open in the process
+that does the bind**. Writing the descriptors in one process and binding in
+another always fails this way. The same gadget with `ncm.0` instead of `ffs`
+binds fine, which is what identifies it as ffs and not the gadget.
+
+So the order is: gadget up -> ep0 open -> descriptors -> *then* the UDC.
+
+## Constraints on this phone
+
+* **One gadget per boot is not a thing** -- a second gadget (`hd2`) works fine.
+  `mkdir` can fail with `ENOMEM`/`EEXIST` when a previous gadget was removed in
+  the same boot and left its `android%d` class device behind; a reboot clears
+  it. Treat ENOMEM on `mkdir` as "try another name, or reboot", not "unsupported".
+* **`ln -s configs/c.1 c.1` returns EPERM.** The gadget-to-configuration
+  association is implicit; the phone's own `g1` has no such symlink either. Don't
+  write it.
+* **A second configuration in one gadget returns EBUSY.** Use the one there is.
+* **`max_speed` takes the literal `high-speed`** -- `high` and `full` give EINVAL
+  -- and only while the gadget is unbound, which is why the bridge unbind its
+  own gadget before writing it rather than only taking the UDC off *other*
+  gadgets.
+* **ffs instance names leak.** After `umount -l` a `functionfs` instance stays
+  "mounted" forever and refuses a new mount with `EBUSY`. Use a **unique name per
+  run** (`usb<pid>`), and unlink/umount on a clean exit.
+* **The vendor USB HAL rebinds `g1` within milliseconds** of taking the UDC
+  away. `stop vendor.usb-hal` while passthrough runs and `start` it again on exit.
+* The configfs function name must be `ffs.<name>` (the type comes first).
+* `mount(2)`: the functionfs instance name is the mount **source**, not the data
+  string -- anything in the data string is parsed as a mount option and comes back
+  EINVAL.
+
+## Verified on the phone
+
+With the guest in fastboot (`-bios lk.bin` so no NAND transfer is needed), the
+bridge walks the gadget over USB/IP and gets real answers:
+
+```
+emu: <- 80 06 value 0100 length 64        (GET_DESCRIPTOR DEVICE)
+emu: -> 18 bytes, status 0
+emu: <- 80 06 value 0200 length 9 / 32    (GET_DESCRIPTOR CONFIGURATION)
+emu: -> 9 bytes / 32 bytes, status 0
+emu: <- 0301 / 0302 / 0303                (the three strings)
+emu: -> 14 / 16 / 18 bytes
+emu: 18d1:0d02, 32 bytes of configuration, 3 strings
+configfs: manufacturer = Google
+configfs: product = Android
+configfs: serialnumber = fastboot
+emu: 3 descriptors, 2 endpoints
+```
+
+and a static FunctionFS gadget on the same phone enumerates on the laptop as the
+HD2:
+
+```
+Bus 001 Device 015: ID 0bb4:0c02 HTC ...
+Negotiated speed: High Speed (480Mbps)
+  iManufacturer 1 HTC   iProduct 2 HD2 (emulated)   iSerial 3 0123456789
+  Interface 0: class 255, bulk 512, ep81 IN / ep01 OUT
+```
+
+## Still to do
+
+1. **The unexplained stalls** (above): transfers that stop part way with the
+   host waiting for the rest. The bridge now says which side went quiet; that
+   log line, from a run that does it, is what is missing.
+2. A USB/IP re-attach that leaves the guest's queue heads primed for endpoints
+   the bridge has gone away from, if a second start ever turns out to need it
+   (`usbip_link_reset()` handles the host side; the guest side is untested
+   because it never came up).
+
+## Debugging helpers (not part of the APK)
+
+Deliberately outside `android/`: they are for working on the phone, not shipped.
+
+* `tools/androotsh/androotsh.c` -- a root shell over TCP, so adb dropping (which
+  happens whenever the USB state changes) does not stop the work. Build with the
+  NDK; `-static` does **not** work (bionic wants a 64-byte-aligned TLS segment),
+  so it is a dynamic binary.
+  Start: `adb shell 'su -c "nohup /data/local/tmp/androotsh --port 7777 &"'`;
+  stop: `pkill -x androotsh` (exact name -- `pkill -f` matches your own `su -c`
+  command line and kills the shell running it).
+* `tools/ph` -- run a shell command as root over that socket:
+  `tools/ph 'id'`, or a script on stdin. `PH_ADDR` overrides the phone's address.
+* A local `python3 -m http.server` plus the phone's `curl` is the reliable way to
+  move binaries over (chunked base64 through a shell loses bytes).
+
+## Rules for working on this phone
+
+* **Never reboot it.** Root here is temporary and its annoying to trigger everytime usb stack can be recovered without reboot
+* **Never write `sys.usb.config`.** Setting it restarts adbd, and adb here is
+  over wifi: it takes the connection with it. Only ever `stop`/`start
+  vendor.usb-hal` and write the UDC file.
+* When the phone's own USB has been taken over, put it back: unbind the UDC, then
+  `start vendor.usb-hal`. `adb` over wifi survives all of it.

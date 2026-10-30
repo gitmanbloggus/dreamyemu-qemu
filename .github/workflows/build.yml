@@ -1,0 +1,313 @@
+# Build the emulator for Linux, the Android app and the web UI, on every push
+# and pull request.
+#
+# Run it locally with nektos/act instead of pushing:
+#   act --list          # the jobs below
+#   act -j lint         # shell/python/YAML checks (seconds)
+#   act -j linux        # the Linux emulator
+#   act -j web          # the web UI, built and packaged
+#   act -j android      # the APK (downloads the NDK, several GB)
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Cheap and first: it fails in seconds on the mistakes a build would take
+  # minutes to reach.  This is the job to run under `act` while editing.
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shell syntax
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            case "$(head -n 1 "$f")" in
+              *bash*) bash -n "$f" || { echo "::error file=$f::shell syntax error"; fail=1; } ;;
+              *sh*)   sh -n   "$f" || { echo "::error file=$f::shell syntax error"; fail=1; } ;;
+            esac
+          done < <(find tools -type f \( -name '*.sh' -o -perm -u+x \) | sort)
+          exit $fail
+
+      - name: python syntax
+        run: |
+          # ast.parse, not compileall: it checks every tool without leaving
+          # __pycache__/*.pyc behind (which matters for `act --bind`).
+          python3 - <<'PY'
+          import ast, glob, sys
+          bad = 0
+          for f in sorted(glob.glob("tools/**/*.py", recursive=True)):
+              try:
+                  ast.parse(open(f, encoding="utf-8").read(), f)
+              except SyntaxError as e:
+                  print(f"::error file={f}::{e}")
+                  bad = 1
+          sys.exit(bad)
+          PY
+
+      - name: workflow YAML
+        run: |
+          # GitHub's runners already have PyYAML; a bare container does not.
+          python3 -c 'import yaml' 2>/dev/null || {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq python3-yaml
+          }
+          python3 - <<'PY'
+          import glob, sys
+          try:
+              import yaml
+          except ImportError:
+              sys.exit("PyYAML is not installed")
+          for f in sorted(glob.glob(".github/workflows/*.yml")):
+              yaml.safe_load(open(f))
+              print("ok:", f)
+          PY
+
+  linux:
+    name: Linux emulator
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build pkg-config flex bison \
+            python3 python3-venv python3-pip \
+            libglib2.0-dev libpixman-1-dev libslirp-dev libsdl2-dev
+          # Ubuntu's meson is 1.3.x, but QEMU 11 requires >= 1.5.0; take a
+          # current one from PyPI and put it on the path for the next step.
+          python3 -m pip install --user --break-system-packages 'meson>=1.5.0'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: meson version
+        run: meson --version
+
+      - name: build
+        run: tools/build-linux.sh
+
+      - name: check the binaries
+        run: |
+          ./src/qemu/build/qemu-system-arm --version
+          ./src/qemu/build/qemu-system-hexagon --version
+          # the machine really is in there
+          ./src/qemu/build/qemu-system-arm -M help | grep -qw htcleo
+          # the plugin AMSSLOG=1 loads
+          test -f src/qemu/build/contrib/plugins/libamsslog.so
+
+      # A zipped artifact also loses the executable bit (files come back 644),
+      # so the two binaries go into a tarball and that is uploaded as-is:
+      # upload-artifact v7 ships a single file without wrapping it in a zip.
+      - name: package
+        run: |
+          tar -czf htcleo-linux-x86_64.tar.gz \
+            -C src/qemu/build qemu-system-arm qemu-system-hexagon
+          tar -tvzf htcleo-linux-x86_64.tar.gz
+
+      # act's artifact server predates v7's non-zipped API (it rejects the new
+      # mime_type field), so a local `act` run skips the upload; see
+      # docs/building.md.  GitHub does it.
+      - if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: htcleo-linux-x86_64.tar.gz
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      # GitHub's runner ships its own Android SDK and exports ANDROID_HOME,
+      # ANDROID_SDK_ROOT and the NDK variables pointing at it.  fetch-toolchain.sh
+      # honours ANDROID_SDK_ROOT, so without this it installs the SDK and NDK
+      # into the runner's SDK and ~/Android/Sdk - which the APK step and the
+      # cache below use - is never created.  Pin every step to the scripts'
+      # default path; the NDK path is taken from the version fetch-toolchain.sh
+      # installs so the two cannot drift.
+      - name: pin the SDK location
+        run: |
+          echo "ANDROID_HOME=$HOME/Android/Sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$HOME/Android/Sdk" >> "$GITHUB_ENV"
+          ndk=$(sed -n 's/^NDK_VERSION="\(.*\)"/\1/p' android/scripts/fetch-toolchain.sh)
+          echo "ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$HOME/Android/Sdk/ndk/$ndk" >> "$GITHUB_ENV"
+
+      # The cross build runs on the host too: meson/ninja/pkg-config for glib,
+      # pixman, libslirp and dtc; flex/bison for dtc; python3 (with packaging,
+      # which glib's meson insists on) and a venv for QEMU's configure.
+      # libglib2.0-dev is the *build machine's* glib, which is separate from
+      # the glib cross-compiled into the prefix: QEMU's Hexagon target builds a
+      # native idef-parser against it (dependency('glib-2.0', native: true)),
+      # and without it configure dies with "Dependency glib-2.0 not found".
+      - name: build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build pkg-config flex bison \
+            libglib2.0-dev \
+            python3 python3-venv python3-pip python3-packaging \
+            xz-utils bzip2
+          python3 -m pip install --user --break-system-packages 'meson>=1.5.0'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # The NDK and the SDK are the slow part; keep them across runs.  The
+      # install path is pinned to fetch-toolchain.sh's default (~/Android/Sdk)
+      # above, so a local `act` run does not drop a multi-GB SDK into the
+      # checkout.
+      - name: cache the toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Android/Sdk/ndk
+            ~/Android/Sdk/platforms
+            ~/Android/Sdk/build-tools
+            ~/Android/Sdk/cmdline-tools
+            ~/toolchain/jdk
+            ~/toolchain/gradle-8.11.1
+            android/build/dl
+            android/build/prefix
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: android-${{ runner.os }}-${{ hashFiles('android/scripts/fetch-toolchain.sh', 'android/scripts/build-native.sh') }}
+
+      - name: toolchain (JDK, Gradle, SDK, NDK)
+        run: android/scripts/fetch-toolchain.sh
+
+      - name: native (QEMU for Android)
+        run: android/scripts/build-native.sh
+
+      - name: APK
+        working-directory: android
+        run: |
+          export ANDROID_HOME="$HOME/Android/Sdk"
+          export ANDROID_SDK_ROOT="$HOME/Android/Sdk"
+          export JAVA_HOME="$HOME/toolchain/jdk"
+          ./gradlew assembleDebug --no-daemon
+
+      - name: check the APK
+        run: |
+          apk=android/app/build/outputs/apk/debug/app-debug.apk
+          test -f "$apk"
+          # the three binaries the app exec's have to be inside it
+          unzip -l "$apk" | grep -q 'lib/arm64-v8a/libhtcleo-qemu.so'
+          unzip -l "$apk" | grep -q 'lib/arm64-v8a/libhtcleo-q6.so'
+          unzip -l "$apk" | grep -q 'lib/arm64-v8a/libhtcleo-usbffs.so'
+
+      # archive: false ships the APK itself instead of a zip around an APK, and
+      # with it the artifact name is the file's, so give it the repo's name.
+      - name: stage the APK
+        run: mv android/app/build/outputs/apk/debug/app-debug.apk htcleo-debug.apk
+
+      # act's artifact server predates v7's non-zipped API (it rejects the new
+      # mime_type field), so a local `act` run skips the upload (docs/building.md).
+      - if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: htcleo-debug.apk
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+  web:
+    name: Web UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node >= 22.18: the server runs server/index.ts with Node's own
+      # TypeScript stripping, with no build step (tools/deploy-web.sh checks).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: install
+        working-directory: web
+        run: npm ci
+
+      - name: typecheck and lint
+        working-directory: web
+        run: |
+          npm run typecheck
+          npm run lint
+
+      - name: build
+        working-directory: web
+        run: npm run build
+
+      # A tree that runs as-is, and nothing else: the Next build, the custom
+      # server (Node runs server/index.ts straight, no compile step), lib/
+      # (server/config.ts imports DEFAULT_CONFIG from it) and the production
+      # dependencies the server actually loads.  app/, components/ and the tool
+      # configs are compile-time only.  Unpack it and run
+      # `NODE_ENV=production node server/index.ts`; it still wants the NAND
+      # images and the two QEMU binaries beside it at runtime, which is the
+      # layout tools/deploy-web.sh installs.
+      - name: package
+        working-directory: web
+        run: |
+          npm prune --omit=dev
+          # the lockfile also brings the other-libc native builds and packages
+          # the server never loads: sharp/@img (nothing uses next/image),
+          # lucide-react (bundled into .next) and the type-only leftovers.
+          rm -rf node_modules/@next/swc-linux-x64-musl \
+                 node_modules/@img \
+                 node_modules/lucide-react \
+                 node_modules/@types \
+                 node_modules/@tailwindcss
+          cd ..
+          tar -czf hd2-web-ui.tar.gz \
+            --exclude='web/.next/cache' \
+            --exclude='web/node_modules/.cache' \
+            --exclude='*.map' \
+            web/.next web/lib web/public web/server \
+            web/node_modules web/next.config.ts web/package.json
+          ls -lh hd2-web-ui.tar.gz
+
+      # what the tar command above is supposed to have picked, so `act` still
+      # checks the packaging even though it cannot do the upload.
+      - name: check the bundle
+        run: |
+          tar -tzf hd2-web-ui.tar.gz > /tmp/tree
+          grep -qx 'web/server/index.ts' /tmp/tree
+          grep -qx 'web/lib/emulator-types.ts' /tmp/tree
+          grep -qx 'web/.next/BUILD_ID' /tmp/tree
+          grep -qx 'web/next.config.ts' /tmp/tree
+          # the sources, the tool configs and the dev leftovers are not in there
+          ! grep -qE '^web/(app|components)/' /tmp/tree
+          ! grep -qE '^web/(eslint\.config\.mjs|tsconfig\.json|next-env\.d\.ts)$' /tmp/tree
+          ! grep -q '^web/node_modules/typescript/' /tmp/tree
+          ! grep -q 'swc-linux-x64-musl' /tmp/tree
+          ! grep -q '\.map$' /tmp/tree
+
+      # act's artifact server predates v7's non-zipped API (it rejects the new
+      # mime_type field), so a local `act` run skips the upload (docs/building.md).
+      - if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: hd2-web-ui.tar.gz
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
