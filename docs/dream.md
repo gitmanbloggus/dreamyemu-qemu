@@ -98,8 +98,28 @@ src/qemu/build/qemu-system-arm -M dream,keys=home+power -bios spl.bin \
 ```
 
 Measured: Home+Power reaches RA's menu ("Build : RA-dream-v1.7.0") within
-25-75 s of power-on. Its "Flash zip from sdcard" needs the SD card, which
-is not modeled yet.
+25-75 s of power-on.
+
+### microSD
+
+SDC1 (0xA0400000, IRQs 24/25, the WiFi slot, empty) and SDC2 (0xA0500000,
+IRQs 26/27) are the HD2's `msm-sdcc`; `-drive if=sd,format=raw,file=...`
+puts a card in SDC2. Card detect is the CPLD's SDMC_CD_N at +0x0A, which
+already reads 0 (= card in). A card with FAT32 + ext2, the zip in the root:
+
+```bash
+truncate -s 1G images/dream_sd.img
+printf 'label: dos\n2048,1546240,c\n,,83\n' | sfdisk images/dream_sd.img
+#   mkfs.vfat -F 32 / mke2fs -t ext2 each partition, dd them in, then:
+python3 tools/fat_put.py images/dream_sd.img / rom.zip
+```
+
+Measured with RA-dream 1.7.0: "Flash zip from sdcard" lists the zip, and
+"Wipe data/factory reset" formats DATA and CACHE. Installing
+JACxHeroSki 2.2a stops at `set_perm_recursive ... SYSTEM:xbin` ("Can't
+chown/mod /system/xbin"): its ~80 MB /system does not fit the stock SPL's
+67.5 MB `system` (0x02E40000..0x071C0000); the ROM wants the Danger SPL's
+layout. Keys over the monitor need a hold time (`sendkey alt-f 400`).
 
 ### Past the setup wizard
 

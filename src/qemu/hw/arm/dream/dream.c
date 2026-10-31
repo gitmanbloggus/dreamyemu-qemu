@@ -60,6 +60,8 @@
 #include "dream_synaptics.h"
 #include "hw/i2c/i2c.h"
 #include "../htcleo/msm_modem.h"
+#include "../htcleo/msm_sdcc.h"
+#include "hw/sd/sd.h"
 
 #define DREAM_SMI_BASE          0x00000000
 #define DREAM_SMI_SIZE          (64 * MiB)
@@ -97,6 +99,13 @@
 #define DREAM_INT_PWB_I2C           34
 #define DREAM_INT_NAND_WR_ER_DONE   36
 #define DREAM_INT_NAND_OP_DONE      37
+#define DREAM_INT_SDC1_0            24      /* irqs-7x00.h */
+#define DREAM_INT_SDC1_1            25
+#define DREAM_INT_SDC2_0            26
+#define DREAM_INT_SDC2_1            27
+
+#define DREAM_SDC1_PHYS         0xA0400000      /* WiFi (SDIO), no card */
+#define DREAM_SDC2_PHYS         0xA0500000      /* the microSD slot */
 
 #define DREAM_GPIO_LCD_VSYNC    97
 
@@ -169,7 +178,7 @@ static void dream_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *smi = g_new(MemoryRegion, 1);
-    DeviceState *vic, *csr, *modem, *mdp, *mddi, *dev;
+    DeviceState *vic, *csr, *modem, *mdp, *mddi, *adm, *dev;
     MsmGpioState *gpio;
     I2CBus *i2c;
     DeviceState *ts;
@@ -303,11 +312,42 @@ static void dream_init(MachineState *machine)
         sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_UART1 + i));
     }
 
-    dev = qdev_new(TYPE_MSM_ADM);
+    adm = dev = qdev_new(TYPE_MSM_ADM);
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, DREAM_DMOV_PHYS);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_ADM_AARM));
+
+    /*
+     * SD controllers, the HD2's msm-sdcc: SDC1 is the WiFi SDIO slot (no
+     * card), SDC2 the microSD slot with -drive if=sd.  The slot's switch
+     * is the CPLD's TROUT_GPIO_SDMC_CD_N, read at +0x0A as 0 = card in,
+     * so the kernel always sees a card; with no drive it times out.
+     */
+    for (int i = 0; i < 2; i++) {
+        static const hwaddr base[2] = { DREAM_SDC1_PHYS, DREAM_SDC2_PHYS };
+        static const int irq[2][2] = {
+            { DREAM_INT_SDC1_0, DREAM_INT_SDC1_1 },
+            { DREAM_INT_SDC2_0, DREAM_INT_SDC2_1 },
+        };
+
+        dev = qdev_new(TYPE_MSM_SDCC);
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, base[i]);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, irq[i][0]));
+        sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(vic, irq[i][1]));
+        msm_sdcc_connect_adm(dev, adm, base[i]);
+        dinfo = i == 1 ? drive_get(IF_SD, 0, 0) : NULL;
+        if (dinfo) {
+            DeviceState *card = qdev_new(TYPE_SD_CARD);
+
+            qdev_prop_set_drive_err(card, "drive", blk_by_legacy_dinfo(dinfo),
+                                    &error_fatal);
+            qdev_realize_and_unref(card, qdev_get_child_bus(dev, "sd-bus"),
+                                   &error_fatal);
+        }
+    }
 
     dev = qdev_new(TYPE_MSM_NAND);
     qdev_prop_set_uint32(dev, "flash-id", DREAM_NAND_ID);
