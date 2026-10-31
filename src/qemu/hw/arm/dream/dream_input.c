@@ -103,6 +103,12 @@ static const uint16_t kp_map[NOUT * NIN] = {
 #define CPLD_IN             0x08
 #define CPLD_MASK           0x0C
 #define CPLD_STATUS         0x0E
+/*
+ * The "VIRTUAL" bank (GPIO 176+): trout_sdslot_status (vmlinux 0xC002E9A4)
+ * reports a card while gpio_get_value(176) is 0.  Left at 0 the kernel saw
+ * a card in an empty slot and timed out on every command.
+ */
+#define CPLD_VIRTUAL        0x12
 
 static const int tb_gpio[2][2] = { { 18, 19 }, { 94, 90 } };
 static const uint8_t gray[4] = { 0, 1, 3, 2 };
@@ -122,6 +128,7 @@ typedef struct DreamInput {
     uint8_t cpld_in;        /* pressed = 0 */
     uint8_t cpld_mask;      /* 1 = masked */
     uint8_t cpld_status;
+    uint8_t cpld_virtual;   /* 0x12, GPIO 176+: bit 0 = SD card absent */
     bool pressed[NOUT * NIN];
     bool power;
     bool kbd_open;          /* keyboard slid out */
@@ -178,6 +185,9 @@ static uint64_t cpld_read(void *opaque, hwaddr off, unsigned size)
             break;
         case CPLD_STATUS:
             b = d->cpld_status;
+            break;
+        case CPLD_VIRTUAL:
+            b = d->cpld_virtual;
             break;
         default:
             b = o < 8 ? d->shadow[o] : (o == 0x09 ? 0xFF : 0);
@@ -408,6 +418,18 @@ static void dream_key(DreamInput *d, int code, bool down)
 
 static DreamInput *dream_input;
 
+static void sd_detect(void *opaque, int n, int absent)
+{
+    DreamInput *d = opaque;
+
+    d->cpld_virtual = (d->cpld_virtual & ~1) | !!absent;
+}
+
+qemu_irq dream_input_sd_detect(void)
+{
+    return qemu_allocate_irq(sd_detect, dream_input, 0);
+}
+
 static void dream_key_event(DeviceState *dev, QemuConsole *src,
                             QemuInputEvent *evt)
 {
@@ -492,6 +514,7 @@ static void dream_input_reset(void *opaque)
     d->kbd_open = false;
     d->cpld_in &= ~(1u << CPLD_BIT_LID);       /* keyboard closed */
     d->cpld_mask = 0xFF;
+    d->cpld_virtual = 0x01;         /* no card until the slot says so */
     d->cpld_status = 0;
     d->power = false;
     d->ps_hold = 1;

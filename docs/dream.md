@@ -175,6 +175,24 @@ Open: after the data call, rild answers some `SIGNAL_STRENGTH` and
 `SCREEN_STATE` requests with RADIO_NOT_AVAILABLE for a while (seen in
 logcat; data keeps working). No voice calls or SMS yet.
 
+## microSD
+
+```bash
+sh tools/mksdcard.sh images/sdcard.img 256          # FAT32, as vold expects
+src/qemu/build/qemu-system-arm -M dream ... -drive if=sd,format=raw,file=images/sdcard.img
+```
+
+The Dream reuses the HD2's MSM SDCC model, so commands, PIO and data
+mover (ADM) DMA are already there. SDC1 at `0xA0400000` (IRQs 24/25) is
+the WiFi SDIO slot, left empty. SDC2 at `0xA0500000` (IRQs 26/27) is the
+microSD slot. Its card switch is the CPLD's "virtual" GPIO 176, register
+`0x12` bit 0, low with a card. `trout_sdslot_status` reads it; left at 0,
+the kernel saw a card in an empty slot and timed out on every command.
+Measured: `mmcblk0: mmc1:9cc1 QEMU! 262144KiB`, partition 1 mounts at
+`/sdcard`, and Settings shows 251 MB.
+
+![SD card in Settings](promo/sdcard.png)
+
 ## Audio
 
 ```bash
