@@ -86,29 +86,172 @@ to its account page; trackball Down + press opens the Emergency Dialer.
 ### Past the setup wizard
 
 RC29's wizard needs a Google account to continue, so an offline image is
-stuck at "Welcome to T-Mobile G1". The wizard gates on the Settings
-`device_provisioned` flag in `/data`, so flip it offline and the next boot
-goes to the home screen. `/data` is empty in a fresh image, so the
-settings database only exists after one boot:
+stuck at "Welcome to T-Mobile G1". It is a home activity of its own that
+only disables itself when it finishes, so getting past it takes two edits:
+rename `/system/app/SetupWizard.apk` (PackageManager loads only `*.apk`)
+and set Settings `device_provisioned` in `/data`. `/data` is empty in a
+fresh image, so the settings database only exists after one boot:
 
 ```bash
 cp images/dream_nand_boot.img images/dream_data.img          # a working copy
 src/qemu/build/qemu-system-arm -M dream -bios spl.bin \
     -drive if=mtd,format=raw,file=images/dream_data.img       # no snapshot
 #   ... let it reach the wizard (~30 s), then power off ...
-python3 tools/yaffs.py images/dream_data.img set-provisioned  # device_provisioned=1
+python3 tools/yaffs.py images/dream_data.img set-provisioned
 src/qemu/build/qemu-system-arm -M dream -bios spl.bin \
     -drive if=mtd,format=raw,file=images/dream_data.img,snapshot=on -display sdl
 ```
 
+Measured: the next boot shows the keyguard, and Menu (F1) unlocks to the
+Launcher.
+
+![RC29 home screen after set-provisioned](dream-provisioned.png)
+
 `tools/yaffs.py` reads and edits the YAFFS2 filesystems in the image
-(`--part system|cache|userdata`): `list`, `extract PATH OUT`, and
+(`--part system|cache|userdata`): `list`, `extract PATH OUT`,
 `replace PATH IN` (same size or smaller, rewriting data in place and
-keeping each chunk's spare). `set-provisioned` extracts `settings.db`,
-sets `device_provisioned` (and `install_non_market_apps`) with the `sqlite3`
-module, and writes it back. It does not recompute data-area ECC — the
-msm-nand model treats parity as zero and never checks it, so edits read
-back verbatim in the emulator but would fail a real controller.
+keeping each chunk's spare) and `rename PATH NAME`. Paths are relative to
+the partition, so settings.db is `/data/com.android.providers.settings/...`
+in `userdata`. It takes both a linear 2048+64 image and the msm-nand
+codeword image `dream_nand.py` writes (detected from the tags), and decodes
+the kernel's extra-header-info tags as well as mkyaffs2image's.
+`set-provisioned` renames the wizard, then extracts `settings.db`, sets
+(or, on RC29, inserts) `device_provisioned` and `install_non_market_apps`
+with the `sqlite3` module, and writes it back. It does not recompute
+data-area ECC — the msm-nand model treats parity as zero and never checks
+it, so edits read back verbatim in the emulator but would fail a real
+controller.
+
+## Battery
+
+`htc_battery` asks the modem's RPC program `0x30100001` for the battery
+(`GET_BATT_INFO`) and serves `0x30100000` for AMSS's unasked updates.
+msm-modem answers with a level, a voltage that follows it, 28.0 C, and the
+charger, and calls the kernel's cable/level procedures when they change.
+Defaults: 85 %, on USB. Change them while it runs, from the monitor:
+
+```
+qom-set /machine/modem batt-level 12
+qom-set /machine/modem batt-charger 0      # 0 none, 1 USB, 2 AC
+```
+
+The kernel picks the change up within about 2 s. Measured: 12 % with no
+charger brings up Android's "Please connect charger" dialog. At 0 % on
+battery Android powers the phone off, as it would on the real phone.
+
+![Low-battery warning after qom-set](dream-battery.png)
+
+The RPC router only started once smd-v1 channels that open straight to
+OPENED (2.6.25 skips OPENING) ran the open hooks too. Before that the
+kernel kept its built-in defaults and showed "Charging (100%)".
+
+## Mobile data
+
+```bash
+src/qemu/build/qemu-system-arm -M dream -bios spl.bin \
+    -drive if=mtd,format=raw,file=images/dream_data.img,snapshot=on \
+    -nic user,model=msm-modem,net=10.0.3.0/24 -display sdl
+```
+
+The emulated SIM is T-Mobile US (310/260), so RC29's stock APN
+(`epc.tmobile.com`) applies and Android starts a data call on its own once
+the radio registers (about 20 s after power-on). The phone gets 10.0.3.15,
+gateway 10.0.3.2 and DNS 10.0.3.3 from QEMU's user-mode network.
+
+HTC's RIL does not dial with AT on the Dream. It writes `up:<apn>` to
+`/dev/qmi0`, and the kernel's smd_qmi driver talks QMI to the modem over
+SMD `DATA5_CNTL`: a WDS client id, START_NETWORK (the modem answers with a
+handle), a broadcast packet-service indication (CONNECTED), then the
+runtime settings (address, mask, gateway, DNS). `msm_qmi.c` is the modem's
+side of that. rild then configures `rmnet0`, which on 2.6.25 is an Ethernet
+device with its own MAC: whole frames, ARP included, go over SMD `DATA5`
+and are passed to the `msm-modem` NIC unchanged. Measured: the Browser
+loads google.com, with the 3G data icon in the status bar.
+
+![The Browser on mobile data](dream-data.png)
+
+`-global msm-modem.trace=on` logs the QMI messages and every rmnet frame.
+Open: after the data call, rild answers some `SIGNAL_STRENGTH` and
+`SCREEN_STATE` requests with RADIO_NOT_AVAILABLE for a while (seen in
+logcat; data keeps working). No voice calls or SMS yet.
+
+## Custom recovery
+
+```bash
+cp images/dream_data.img images/dream_ra.img
+python3 tools/dream_flash.py images/dream_ra.img recovery recovery-RA-dream-v1.7.0.img
+src/qemu/build/qemu-system-arm -M dream,keys=power+home -bios spl.bin \
+    -drive if=mtd,format=raw,file=images/dream_ra.img \
+    -drive if=sd,format=raw,file=images/sdcard.img -display sdl
+```
+
+`dream_flash.py` erases a partition (recovery, boot, misc) and programs an
+image into it, as `fastboot flash` would.
+
+Measured with Amon_RA's RA-dream v1.7.0, which brings its own, newer
+kernel:
+- The menu comes up, and keyboard shortcuts work (Alt+F, Alt+W, Alt+B …,
+  HOME to confirm). The trackball does not move the selection yet.
+- "Flash zip from sdcard" reads the SD card.
+- "Wipe cache" erases and formats the partition.
+- "Nand backup" writes boot, system, data and cache with an MD5 list to
+  `/sdcard/nandroid/`. The `boot.img` it dumped is byte-identical to the
+  RC29 boot image in the NBH, and its MD5 matches RA's.
+
+![RA-dream v1.7.0](promo/ra-recovery.png) ![Nandroid backup](promo/ra-nandroid.png)
+
+## microSD
+
+```bash
+sh tools/mksdcard.sh images/sdcard.img 256          # FAT32, as vold expects
+src/qemu/build/qemu-system-arm -M dream ... -drive if=sd,format=raw,file=images/sdcard.img
+```
+
+The Dream reuses the HD2's MSM SDCC model, so commands, PIO and data
+mover (ADM) DMA are already there. SDC1 at `0xA0400000` (IRQs 24/25) is
+the WiFi SDIO slot, left empty. SDC2 at `0xA0500000` (IRQs 26/27) is the
+microSD slot. Its card switch is the CPLD's "virtual" GPIO 176, register
+`0x12` bit 0, low with a card. `trout_sdslot_status` reads it; left at 0,
+the kernel saw a card in an empty slot and timed out on every command.
+Measured: `mmcblk0: mmc1:9cc1 QEMU! 262144KiB`, partition 1 mounts at
+`/sdcard`, and Settings shows 251 MB.
+
+![SD card in Settings](promo/sdcard.png)
+
+## Audio
+
+```bash
+src/qemu/build/qemu-system-arm -M dream ... \
+    -audiodev pa,id=snd0 -global msm-modem.audiodev=snd0     # or sdl, wav,path=out.wav
+```
+
+PCM playback (ringtones, notifications, touch tones, anything Android
+mixes in software) goes through the 2.6.25 qdsp5 driver's host PCM path,
+and `msm_qdsp5.c` plays the DSP's part:
+
+- **audmgr:** RPC `0x30000013:e94e8f0c` ENABLE_CLIENT, answered with the
+  READY and CODEC_CONFIG callbacks on the caller's endpoint.
+- **ADSP RTOS:** RPC `0x3000000a:71d1094b`. A module enable is answered
+  with an event to the kernel's `0x3000000b:ee3a9966` (READY, image 0).
+- **DSP window:** PA `0xAC000000`. It has 4 MiB of DSP memory, write_ctrl
+  at `+0x400034`, read_ctrl at `+0x400038` and the doorbell at `+0xC00200`.
+  The ADSP interrupts on IRQ 23 (`msm_adsp_probe` requests `0x17`).
+- **audpp (task 9):** queue 1 `{4, 0xFFFF}` is answered with CFG ENABLE.
+  The PCM driver's queue 2 config names its two buffers, rate and channels.
+  Each filled buffer is read from RAM, written to QEMU's audio backend, and
+  handed back with HOST_PCM_INTF after its own duration.
+
+All of the above was read from the RC29 kernel: symbols come from its
+kallsyms, offsets from `adsp_init_info` and the module and queue tables.
+Measured: the Settings ringtone preview streams 145 buffers of 4800 bytes
+(44.1 kHz stereo) and the capture holds 3.1 s of the tone
+([docs/promo/ringtone-preview.wav](promo/ringtone-preview.wav)).
+
+Not modelled yet: the DSP decoders (`/dev/msm_mp3`, AAC), so MP3 playback
+in Music does not work. Also missing are recording (audrec, audpreproc),
+volume, EQ and the voice-call path. Those commands are accepted and
+ignored. The same change gives `time_remote` and audmgr the 2.6.25 RPC
+versions (hashes), so the kernel's `rs30000048` device now matches too.
 
 ## Buttons, HBOOT and recovery keys
 

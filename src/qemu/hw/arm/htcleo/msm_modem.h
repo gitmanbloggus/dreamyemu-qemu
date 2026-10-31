@@ -64,6 +64,15 @@ struct MsmModemState {
     QEMUTimer *rpc_timer;
     uint64_t rpc_calls;
 
+    /* HTC battery (msm_rpc.c): settable at run time with qom-set */
+    uint32_t batt_level;        /* percent */
+    uint32_t batt_charger;      /* 0 none, 1 USB, 2 AC */
+    uint32_t batt_sent_level, batt_sent_charger;
+    QEMUTimer *batt_timer;
+
+    /* QDSP5 (msm_qdsp5.c, the Dream) */
+    struct MsmQdsp5 *qdsp5;
+
     /* QDSP6 (msm_qdsp6.c) */
     AudioBackend *audio_be;
 
@@ -121,6 +130,25 @@ void msm_atmodem_reset(MsmModemState *s);
 void msm_atmodem_opened(MsmModemState *s, SmdChan *c);
 void msm_at_input(MsmModemState *s, SmdChan *c, const uint8_t *buf, int len);
 void msm_ppp_input(MsmModemState *s, SmdChan *c, const uint8_t *buf, int len);
+/* 2.6.25 rmnet: one raw IP datagram per SMD packet on DATA5-7 */
+void msm_rmnet_input(MsmModemState *s, SmdChan *c, const uint8_t *buf,
+                     int len);
+/* a QMI data call on the rmnet channel `data` (DATA5-7) up or down */
+void msm_rmnet_set_active(MsmModemState *s, const char *data, bool on);
+bool msm_rmnet_is_active(MsmModemState *s, const char *data);
+void msm_rmnet_addrs(MsmModemState *s, uint32_t *ip, uint32_t *gw,
+                     uint32_t *dns);
+
+/* msm_qdsp5.c: the Dream's ADSP at `base`, and its RPC programs */
+void msm_qdsp5_init(MsmModemState *s, MemoryRegion *sysmem, hwaddr base,
+                    qemu_irq irq);
+void msm_qdsp5_audmgr_call(MsmModemState *s, uint32_t proc,
+                           const uint8_t *args, uint32_t len);
+void msm_qdsp5_adsp_call(MsmModemState *s, uint32_t proc,
+                         const uint8_t *args, uint32_t len);
+
+/* msm_qmi.c: QMUX on DATA5-7_CNTL */
+void msm_qmi_input(MsmModemState *s, SmdChan *c, const uint8_t *buf, int len);
 
 /* msm_gps.c */
 void msm_gps_init(MsmModemState *s);

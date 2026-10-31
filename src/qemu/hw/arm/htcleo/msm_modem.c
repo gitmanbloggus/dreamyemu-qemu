@@ -899,6 +899,19 @@ static void smd_scan(MsmModemState *s, bool dsp)
             if (modem_st != SMD_SS_OPENED) {
                 smd_set_modem_state(s, &c, SMD_SS_OPENED);
                 kick = true;
+                /*
+                 * 2.6.25 (smd-v1) goes straight to OPENED without OPENING
+                 * (measured: no "opened" trace, and the RPC router never
+                 * got its HELLO), so the open hooks run here as well.
+                 */
+                if (s->smd_v1) {
+                    if (s->trace) {
+                        qemu_log("modem: smd ch%d '%s' opened\n", n, c.name);
+                    }
+                    g_byte_array_set_size(s->pkt_acc[n], 0);
+                    msm_modem_smd_opened(s, &c);
+                    msm_atmodem_opened(s, &c);
+                }
             }
             break;
         case SMD_SS_CLOSING:
@@ -1031,6 +1044,14 @@ static void smem_build_v1(MsmModemState *s)
 {
     static const struct { int cid; const char *name; } chans[] = {
         { 0, "DS" }, { 1, "DIAG" }, { 2, "RPCCALL" },
+        /*
+         * rmnet0-2: raw IP, one SMD packet per datagram (cid > 4 makes
+         * them packet channels).  The cids are not the stock modem's
+         * (not measured); the kernel finds channels by name.
+         */
+        { 5, "DATA5" }, { 6, "DATA6" }, { 7, "DATA7" },
+        /* their QMI control channels, /dev/qmi0-2 (msm_qmi.c) */
+        { 8, "DATA5_CNTL" }, { 9, "DATA6_CNTL" }, { 10, "DATA7_CNTL" },
     };
     uint32_t next = SMEM_HEAP_START, tbl;
 
@@ -1272,6 +1293,18 @@ static void modem_init(Object *obj)
 
     qdev_init_gpio_in_named(DEVICE(obj), modem_a2m, "a2m", 16);
     qdev_init_gpio_out_named(DEVICE(obj), s->m2a, "m2a", M2A_NUM);
+    /*
+     * The battery as AMSS reports it to htc_battery; plain properties so
+     * qom-set can change them while the guest runs:
+     *   qom-set /machine/modem batt-level 15
+     *   qom-set /machine/modem batt-charger 0      (0 none, 1 USB, 2 AC)
+     */
+    s->batt_level = 85;
+    s->batt_charger = 1;
+    object_property_add_uint32_ptr(obj, "batt-level", &s->batt_level,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_add_uint32_ptr(obj, "batt-charger", &s->batt_charger,
+                                   OBJ_PROP_FLAG_READWRITE);
 }
 
 static const Property modem_props[] = {

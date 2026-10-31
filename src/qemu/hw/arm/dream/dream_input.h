@@ -7,4 +7,7 @@
 void dream_input_init(MsmGpioState *gpio, const char *boot_keys,
                       DeviceState *touchscreen);
 
+/* the microSD slot's card switch (CPLD GPIO 176): level 1 = no card */
+qemu_irq dream_input_sd_detect(void);
+
 #endif
