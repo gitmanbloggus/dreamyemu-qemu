@@ -119,7 +119,32 @@ Measured with RA-dream 1.7.0: "Flash zip from sdcard" lists the zip, and
 JACxHeroSki 2.2a stops at `set_perm_recursive ... SYSTEM:xbin` ("Can't
 chown/mod /system/xbin"): its ~80 MB /system does not fit the stock SPL's
 67.5 MB `system` (0x02E40000..0x071C0000); the ROM wants the Danger SPL's
-layout. Keys over the monitor need a hold time (`sendkey alt-f 400`).
+layout. Keys over the monitor need a hold time (`sendkey alt-f 400`);
+RA moves its selection with volume (PgDn), not the trackball, over QMP.
+
+### Bigger /system: CustomMTD
+
+Firerat's CustomMTD (xda t=717874) resizes system/cache/userdata with a
+`mtdparts=msm_nand:` table on the kernel command line, which the SPL
+passes through ("commandline from head") and both RA's 2.6.29 and
+JACxHeroSki's 2.6.29.6 kernels parse (cmdlinepart). Recovery is patched
+offline, the ROM's boot.img on the phone by FR-boot-v1.5.8-CustomMTD_S.zip,
+which copies the table from the running recovery's /proc/cmdline:
+
+```bash
+python3 tools/dream_custommtd.py 90 2 recovery-RA-dream-v1.7.0.img ra-mtd.img
+python3 tools/dream_nand.py --erase-aa --spl spl.bin --nbh DREAIMG-RC29.zip \
+    --recovery ra-mtd.img nand_bringup.img images/dream_nand_rom.img
+#   SD root: the ROM zip and FR-boot-v1.5.8-CustomMTD_S.zip
+#   -M dream,keys=home+power: Wipe data, flash the ROM, flash FR-boot,
+#   then power-cycle without keys= (a reset re-holds the combo)
+```
+
+Measured with JACxHeroSki 2.2a (system 90 MB, cache 2 MB): the install
+completes, FR-boot writes "Custom MTD written", and the ROM's kernel mounts
+mtdblock3/4/5 (system/cache/userdata) and the SD card (mmcblk0 p1 p2);
+init starts rild (SMD ch 0 opened). After 9 min the screen is still the
+G1 splash with the CPU busy; Android has not drawn yet.
 
 ### Past the setup wizard
 
