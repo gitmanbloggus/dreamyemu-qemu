@@ -322,9 +322,35 @@ void msm_mdp_ppp_run(MsmMdpState *s)
     }
     b.dx = R(PPP_OUT_XY) & 0x1fff;
     b.dy = (R(PPP_OUT_XY) >> 16) & 0x1fff;
+    if (s->mddi) {
+        /*
+         * MDP 2.2 (the Dream) writes a mirrored axis from its far end in
+         * 16-pixel tiles, so the 2.6.29 driver (mdp_ppp.c rotate_dst_addr_x
+         * / _y) moves DST0 to the last tile: + (w - 16) * bpp when the
+         * output runs right to left (ROT_90 xor FLIP_LR), + (h - 16) rows
+         * for FLIP_UD.  Undo it to get the ROI's top-left again.  Measured
+         * for ROT_90 alone (JACxHeroSki's landscape apps: a 480x320 surface
+         * blitted into the 320x480 buffer had DST0 = buffer + 0x260, and
+         * taken literally it landed 304 px right, wrapping 16 px around);
+         * the flip cases follow the same rule unmeasured.  MDP 3.1 (the HD2)
+         * does not do this.
+         */
+        int bw = droi & 0xfff, bh = (droi >> 16) & 0xfff;
+
+        if (!!(op & OP_ROT_90) != !!(op & OP_FLIP_LR)) {
+            b.dst.base0 -= (uint32_t)(bw - MIN(16, bw)) * b.dst.bpp;
+        }
+        if (op & OP_FLIP_UD) {
+            b.dst.base0 -= (uint32_t)(bh - MIN(16, bh)) * b.dst.stride0;
+        }
+    }
 
     ppp_img_decode(&b.bg, R(PPP_BG_CFG), R(PPP_BG_PACK), false);
     b.bg.base0 = R(PPP_BG0);
+    if (b.bg.base0 == R(PPP_DST0)) {
+        /* blending onto the destination: the same MDP 2.2 tile offset */
+        b.bg.base0 = b.dst.base0;
+    }
     b.bg.base1 = R(PPP_BG1);
     b.bg.stride0 = R(PPP_BG_YSTRIDE) & 0x3fff;
     b.bg.stride1 = R(PPP_BG_YSTRIDE) >> 16 & 0x3fff;
