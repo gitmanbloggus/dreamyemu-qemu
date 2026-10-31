@@ -308,6 +308,22 @@ static void rpc_dispatch(MsmModemState *s, const RpcMsg *m, RpcReply *r)
     case HTC_BATT_PROG:
         prog_htc_battery(s, m, r);
         break;
+    case 0x30000013:            /* audmgr (the Dream's QDSP5) */
+        if (!s->qdsp5) {
+            prog_default(s, m, r);
+            break;
+        }
+        msm_qdsp5_audmgr_call(s, m->proc, m->args, m->args_len);
+        put_be32(r, 0);
+        break;
+    case 0x3000000a:            /* adsp rtos (the Dream's QDSP5) */
+        if (!s->qdsp5) {
+            prog_default(s, m, r);
+            break;
+        }
+        msm_qdsp5_adsp_call(s, m->proc, m->args, m->args_len);
+        put_be32(r, 0);
+        break;
     default:
         prog_default(s, m, r);
         break;
@@ -614,6 +630,15 @@ void msm_rpc_apps_call(MsmModemState *s, uint32_t prog, uint32_t vers,
             break;
         }
     }
+    /*
+     * A program the modem does not serve (the Dream's ADSP events to
+     * 0x3000000b): any announced address will do; an unknown one leaves
+     * the kernel's reply unroutable (measured: "could not write RPC
+     * response: -113").
+     */
+    if (src_cid == RPC_MODEM_CLIENT_CID && s->rpc_servers->len) {
+        src_cid = g_array_index(s->rpc_servers, RpcServer, 0).cid;
+    }
     msg = g_malloc(len);
     stl_be_p(msg + 0, ++s->rpc_xid);
     stl_be_p(msg + 4, RPC_CALL);
@@ -664,6 +689,24 @@ void msm_modem_rpc_init(MsmModemState *s)
             .vers = modem_programs[i].vers,
             .cid = 0x100 + i,
         };
+        /*
+         * The Dream's 2.6.25 kernel connects to AMSS 1.0's versions,
+         * which are hashes (vmlinux: "rs3000000a:71d1094b",
+         * "rs30000048:0da5b528", audmgr_enable's 0xe94e8f0c).
+         */
+        if (s->smd_v1) {
+            switch (sv.prog) {
+            case 0x30000048:
+                sv.vers = 0x0da5b528;
+                break;
+            case 0x3000000a:
+                sv.vers = 0x71d1094b;
+                break;
+            case 0x30000013:
+                sv.vers = 0xe94e8f0c;
+                break;
+            }
+        }
         g_array_append_val(s->rpc_servers, sv);
     }
 }

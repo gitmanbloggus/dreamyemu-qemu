@@ -175,6 +175,41 @@ Open: after the data call, rild answers some `SIGNAL_STRENGTH` and
 `SCREEN_STATE` requests with RADIO_NOT_AVAILABLE for a while (seen in
 logcat; data keeps working). No voice calls or SMS yet.
 
+## Audio
+
+```bash
+src/qemu/build/qemu-system-arm -M dream ... \
+    -audiodev pa,id=snd0 -global msm-modem.audiodev=snd0     # or sdl, wav,path=out.wav
+```
+
+PCM playback (ringtones, notifications, touch tones, anything Android
+mixes in software) goes through the 2.6.25 qdsp5 driver's host PCM path,
+and `msm_qdsp5.c` plays the DSP's part:
+
+- **audmgr:** RPC `0x30000013:e94e8f0c` ENABLE_CLIENT, answered with the
+  READY and CODEC_CONFIG callbacks on the caller's endpoint.
+- **ADSP RTOS:** RPC `0x3000000a:71d1094b`. A module enable is answered
+  with an event to the kernel's `0x3000000b:ee3a9966` (READY, image 0).
+- **DSP window:** PA `0xAC000000`. It has 4 MiB of DSP memory, write_ctrl
+  at `+0x400034`, read_ctrl at `+0x400038` and the doorbell at `+0xC00200`.
+  The ADSP interrupts on IRQ 23 (`msm_adsp_probe` requests `0x17`).
+- **audpp (task 9):** queue 1 `{4, 0xFFFF}` is answered with CFG ENABLE.
+  The PCM driver's queue 2 config names its two buffers, rate and channels.
+  Each filled buffer is read from RAM, written to QEMU's audio backend, and
+  handed back with HOST_PCM_INTF after its own duration.
+
+All of the above was read from the RC29 kernel: symbols come from its
+kallsyms, offsets from `adsp_init_info` and the module and queue tables.
+Measured: the Settings ringtone preview streams 145 buffers of 4800 bytes
+(44.1 kHz stereo) and the capture holds 3.1 s of the tone
+([docs/promo/ringtone-preview.wav](promo/ringtone-preview.wav)).
+
+Not modelled yet: the DSP decoders (`/dev/msm_mp3`, AAC), so MP3 playback
+in Music does not work. Also missing are recording (audrec, audpreproc),
+volume, EQ and the voice-call path. Those commands are accepted and
+ignored. The same change gives `time_remote` and audmgr the 2.6.25 RPC
+versions (hashes), so the kernel's `rs30000048` device now matches too.
+
 ## Buttons, HBOOT and recovery keys
 
 `-M dream,keys=power+back` holds a combo from power-on (3 s): the SPL

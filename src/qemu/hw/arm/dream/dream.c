@@ -93,6 +93,9 @@
 #define DREAM_INT_MDP               19
 #define DREAM_INT_ADM_AARM          21
 #define DREAM_INT_ADSP_A11          22
+#define DREAM_AD5_PHYS              0xAC000000
+/* the qdsp5 driver's request_irq(0x17) (msm_adsp_probe) */
+#define DREAM_INT_ADSP_A9_A11       23
 #define DREAM_INT_GPIO_GROUP1       32
 #define DREAM_INT_GPIO_GROUP2       33
 #define DREAM_INT_PWB_I2C           34
@@ -266,6 +269,9 @@ static void dream_init(MachineState *machine)
     }
     qdev_connect_gpio_out_named(modem, "m2a", M2A_DSP,
                                 qdev_get_gpio_in(vic, DREAM_INT_ADSP_A11));
+    /* the ADSP (QDSP5) window, PA 0xAC000000 (vmlinux iotable: AD5) */
+    msm_qdsp5_init(MSM_MODEM(modem), sysmem, DREAM_AD5_PHYS,
+                   qdev_get_gpio_in(vic, DREAM_INT_ADSP_A9_A11));
     qemu_register_reset(dream_modem_reset, modem);
 
     dev = qdev_new(TYPE_MSM_GPIO);
