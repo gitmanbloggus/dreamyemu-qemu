@@ -75,6 +75,8 @@ export type EmulatorStatus = {
   pids: { arm?: number; hexagon?: number };
   stream: { fps: number; kbps: number; clients: number; width: number; height: number };
   sensors: { battery: number; cable: Cable };
+  /* -M dream: the keyboard slid out (landscape) */
+  keyboard: boolean;
 };
 
 export type ServerState = {

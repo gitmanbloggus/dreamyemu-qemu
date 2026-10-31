@@ -85,6 +85,7 @@ export class Emulator extends EventEmitter {
   private pids: { arm?: number; hexagon?: number } = {};
   private touch = { x: 0, y: 0, down: false };
   private sensors = { battery: 100, cable: "usb" as Cable };
+  private keyboard = false;
   private op: Promise<void> = Promise.resolve();
 
   constructor(hub: StreamHub) {
@@ -103,6 +104,7 @@ export class Emulator extends EventEmitter {
       pids: this.pids,
       stream: this.hub.statsSnapshot,
       sensors: this.sensors,
+      keyboard: this.keyboard,
     };
   }
 
@@ -173,6 +175,8 @@ export class Emulator extends EventEmitter {
   async reset() {
     if (!this.qmp) throw new Error("The emulator is not running");
     await this.qmp.execute("system_reset");
+    await this.refreshKeyboard();
+    this.emit("status");
     if (this.running && this.running.device !== "dream" && this.running.boot !== "menu") void this.bootKeys(this.running);
   }
 
@@ -386,6 +390,7 @@ export class Emulator extends EventEmitter {
   }
 
   private cleanupClients() {
+    this.keyboard = false;
     this.vnc?.close();
     this.q6vnc?.close();
     this.qmp?.close();
@@ -444,7 +449,29 @@ export class Emulator extends EventEmitter {
     if (events.length) this.qmp.send("input-send-event", { events });
   }
 
+  /* -M dream's keyboard slide (SW_LID), read back so F11 on the guest side stays in step */
+  async refreshKeyboard() {
+    if (!this.qmp || this.running?.device !== "dream") {
+      this.keyboard = false;
+      return;
+    }
+    try {
+      this.keyboard = !!(await this.qmp.execute("qom-get", { path: "/machine", property: "keyboard-open" }));
+    } catch {
+      /* builds before keyboard-open */
+    }
+  }
+
+  async setKeyboard(open: boolean) {
+    if (!this.qmp) throw new Error("The emulator is not running");
+    if (this.running?.device !== "dream") throw new Error("Only the Dream has a keyboard to slide out");
+    await this.qmp.execute("qom-set", { path: "/machine", property: "keyboard-open", value: open });
+    await this.refreshKeyboard();
+    this.emit("status");
+  }
+
   async refreshSensors() {
+    void this.refreshKeyboard();
     if (!this.qmp) return this.sensors;
     try {
       const cable = (await this.qmp.execute("qom-get", { path: "/machine", property: "cable" })) as Cable;

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Camera, Maximize2, Minimize2, Power, Volume2, VolumeX } from "lucide-react";
+import { Camera, Keyboard, Maximize2, Minimize2, Power, RotateCcw, Volume2, VolumeX } from "lucide-react";
 import { DeviceFrame } from "@/components/device/DeviceFrame";
 import { Dialog, Spinner, Toast } from "@/components/holo";
 import { ConfigPanel } from "@/components/panels/ConfigPanel";
@@ -9,7 +9,7 @@ import { DevicePanel, stateColor } from "@/components/panels/DevicePanel";
 import { LogsPanel } from "@/components/panels/LogsPanel";
 import { SensorsPanel } from "@/components/panels/SensorsPanel";
 import { api, useAudio, useControl, useVideo } from "@/lib/client";
-import { geometryFor } from "@/lib/frame-geometry";
+import { boxFor, geometryFor } from "@/lib/frame-geometry";
 import { codeToQcode, type EmulatorConfig, type HardKey, type ServerState } from "@/lib/emulator-types";
 
 const TABS = ["Device", "Config", "Sensors", "Logs"] as const;
@@ -72,6 +72,8 @@ const EmulatorShell = () => {
   const [frameW, setFrameW] = useState(0);
   const [zoom, setZoom] = useState<"fit" | "1:1">("fit");
   const [restartAsk, setRestartAsk] = useState(false);
+  /* the drawn Dream turned on its side by hand (the keyboard turns it too) */
+  const [turned, setTurned] = useState(false);
   const canvas = useRef<HTMLCanvasElement>(null);
   const stage = useRef<HTMLDivElement>(null);
   const focusTarget = useRef<HTMLDivElement>(null);
@@ -98,6 +100,8 @@ const EmulatorShell = () => {
   const device = status?.running?.device ?? config?.device ?? "hd2";
   const geo = geometryFor(device);
   const phone = device === "dream" ? "HTC Dream" : "HD2";
+  const keyboard = device === "dream" && running && !!status?.keyboard;
+  const landscape = device === "dream" && (turned || keyboard);
   const hasPicture = running && !!status && video.lastFrameAt >= status.since;
 
   useEffect(() => {
@@ -107,15 +111,16 @@ const EmulatorShell = () => {
       const r = el.getBoundingClientRect();
       const pad = r.width < 640 ? 16 : 40;
       const { frame, screen, native } = geometryFor(device);
-      const byH = ((r.height - pad * 2) * frame.w) / frame.h;
-      const fitted = Math.max(200, Math.min(r.width - pad * 2, byH));
-      setFrameW(zoom === "1:1" ? (native.w / screen.w) * frame.w : fitted);
+      /* fit the whole drawn phone (turned, with its keyboard), then size the portrait frame inside it */
+      const box = boxFor(device, landscape, keyboard);
+      const scale = Math.max(200 / box.w, Math.min((r.width - pad * 2) / box.w, (r.height - pad * 2) / box.h));
+      setFrameW(zoom === "1:1" ? (native.w / screen.w) * frame.w : scale * frame.w);
     };
     fit();
     const ro = new ResizeObserver(fit);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [zoom, device]);
+  }, [zoom, device, landscape, keyboard]);
 
   const onKey = useCallback(
     (k: HardKey, down: boolean) => {
@@ -142,6 +147,18 @@ const EmulatorShell = () => {
     [say],
   );
 
+  const slideKeyboard = useCallback(
+    async (open: boolean) => {
+      try {
+        await api("/api/keyboard", { method: "POST", body: { open } });
+        say(open ? "Keyboard slid out" : "Keyboard closed");
+      } catch (e) {
+        say((e as Error).message);
+      }
+    },
+    [say],
+  );
+
   const typeText = useCallback(
     async (text: string) => {
       try {
@@ -160,6 +177,12 @@ const EmulatorShell = () => {
       e.preventDefault();
       if (e.repeat) return;
       onKey(hk, down);
+      return;
+    }
+    if (device === "dream" && e.key === "F11") {
+      /* the slide goes through the server, so the drawn keyboard follows it */
+      e.preventDefault();
+      if (down && !e.repeat) void slideKeyboard(!keyboard);
       return;
     }
     if (device === "dream") {
@@ -259,6 +282,24 @@ const EmulatorShell = () => {
           >
             {audio.enabled ? <Volume2 size={22} strokeWidth={1.6} /> : <VolumeX size={22} strokeWidth={1.6} />}
           </ActionButton>
+          {device === "dream" && (
+            <>
+              <ActionButton
+                label={keyboard ? "Close the keyboard (F11)" : "Slide the keyboard out (F11)"}
+                active={keyboard}
+                onClick={() => void (running ? slideKeyboard(!keyboard) : say("Power the phone on first"))}
+              >
+                <Keyboard size={22} strokeWidth={1.6} />
+              </ActionButton>
+              <ActionButton
+                label={keyboard ? "The keyboard holds the phone sideways" : turned ? "Turn upright" : "Turn on its side"}
+                active={landscape}
+                onClick={() => !keyboard && setTurned((t) => !t)}
+              >
+                <RotateCcw size={21} strokeWidth={1.6} />
+              </ActionButton>
+            </>
+          )}
           <ActionButton label={zoom === "fit" ? `Show at 100% (${geo.native.w} × ${geo.native.h})` : "Fit to window"} onClick={() => setZoom(zoom === "fit" ? "1:1" : "fit")}>
             {zoom === "fit" ? <Minimize2 size={21} strokeWidth={1.6} /> : <Maximize2 size={21} strokeWidth={1.6} />}
           </ActionButton>
@@ -294,6 +335,8 @@ const EmulatorShell = () => {
             {frameW > 0 && (
               <DeviceFrame
                 device={device}
+                landscape={landscape}
+                keyboard={keyboard}
                 width={frameW}
                 canvasRef={canvas}
                 send={send}

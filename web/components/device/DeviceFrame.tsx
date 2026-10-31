@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { DREAM_HOTSPOTS, HOTSPOTS, POWER, geometryFor, pct } from "@/lib/frame-geometry";
+import { DREAM_CHIN, DREAM_CHIN_KEYS, DREAM_HOTSPOTS, DREAM_KBD_BODY, DREAM_KEYBOARD, DREAM_SLAB_H, HOTSPOTS, POWER, geometryFor, pct } from "@/lib/frame-geometry";
+import { DreamKeyboard } from "@/components/device/DreamKeyboard";
 import type { Device, HardKey, InputMessage } from "@/lib/emulator-types";
 
 /* Dream key caps: green Call, red End, a pearl trackball, the rest graphite */
@@ -18,7 +19,11 @@ const DREAM_KEY_STYLE: Partial<Record<HardKey, string>> = {
 
 type Props = {
   device: Device;
+  /* the portrait frame's width in CSS pixels */
   width: number;
+  /* -M dream: turned 90 degrees counter-clockwise, and with the keyboard out */
+  landscape?: boolean;
+  keyboard?: boolean;
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
   send: (m: InputMessage) => void;
   interactive: boolean;
@@ -27,16 +32,19 @@ type Props = {
   onKey: (k: HardKey, down: boolean) => void;
 };
 
-export const DeviceFrame = ({ device, width, canvasRef, send, interactive, overlay, pressed, onKey }: Props) => {
+export const DeviceFrame = ({ device, width, landscape = false, keyboard = false, canvasRef, send, interactive, overlay, pressed, onKey }: Props) => {
   const { frame: FRAME, screen: SCREEN, native } = geometryFor(device);
   const dream = device === "dream";
+  const turned = dream && landscape;
   const down = useRef(false);
   const pending = useRef<{ x: number; y: number } | null>(null);
   const raf = useRef(0);
   const [touchAt, setTouchAt] = useState<{ x: number; y: number } | null>(null);
 
+  /* panel coordinates (0..1); turned counter-clockwise, the panel's x runs up the page and its y to the right */
   const norm = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
+    if (turned) return { x: (r.bottom - e.clientY) / r.height, y: (e.clientX - r.left) / r.width };
     return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
   };
 
@@ -85,8 +93,9 @@ export const DeviceFrame = ({ device, width, canvasRef, send, interactive, overl
     onLostPointerCapture: () => pressed.has(k) && onKey(k, false),
   });
 
-  return (
-    <div className="relative select-none" style={{ width, height: (width * FRAME.h) / FRAME.w }}>
+  const height = (width * FRAME.h) / FRAME.w;
+  const phone = (
+    <div className="relative select-none" style={{ width, height }}>
       {dream ? (
         <div
           aria-hidden
@@ -165,6 +174,51 @@ export const DeviceFrame = ({ device, width, canvasRef, send, interactive, overl
           {...keyHandlers(h.key)}
         />
       ))}
+    </div>
+  );
+  if (!turned) return phone;
+  /* the frame unit in CSS pixels */
+  const u = width / FRAME.w;
+  const turn = { transformOrigin: "0 0", transform: `translateY(${width}px) rotate(-90deg)` } as const;
+  if (!keyboard) {
+    /* turned on its side by hand: the whole phone, chin and all */
+    return (
+      <div className="relative select-none" style={{ width: height, height: width }}>
+        <div className="absolute left-0 top-0" style={{ width, height, ...turn }}>
+          {phone}
+        </div>
+      </div>
+    );
+  }
+  /* keyboard out: the slab (screen, no chin) slid up, the chin with the keyboard */
+  return (
+    <div className="relative select-none" style={{ width: height, height: width + DREAM_KEYBOARD.h * u }}>
+      <DreamKeyboard
+        send={send}
+        interactive={interactive}
+        unit={DREAM_KBD_BODY.h * u * 0.14}
+        style={{ left: DREAM_KBD_BODY.x * u, top: DREAM_KBD_BODY.y * u, width: DREAM_KBD_BODY.w * u, height: DREAM_KBD_BODY.h * u, zIndex: 1, paddingTop: 18 * u }}
+      />
+      <div
+        className="absolute z-[1] rounded-[22px] bg-gradient-to-l from-[#2b2b2d] via-[#1a1a1b] to-[#101011] shadow-[inset_0_1px_0_rgba(255,255,255,0.12),0_10px_40px_rgba(0,0,0,0.6)]"
+        style={{ left: DREAM_CHIN.x * u, top: DREAM_CHIN.y * u, width: DREAM_CHIN.w * u, height: DREAM_CHIN.h * u }}
+      >
+        {DREAM_CHIN_KEYS.map((h) => (
+          <button
+            key={h.key}
+            type="button"
+            aria-label={h.label}
+            title={h.label}
+            data-down={pressed.has(h.key)}
+            className={`absolute touch-none shadow-[inset_0_1px_0_rgba(255,255,255,0.15)] transition data-[down=true]:brightness-150 data-[down=true]:shadow-[0_0_14px_rgba(51,181,229,0.6)] ${DREAM_KEY_STYLE[h.key] ?? ""}`}
+            style={{ left: h.x * u, top: h.y * u, width: h.w * u, height: h.h * u }}
+            {...keyHandlers(h.key)}
+          />
+        ))}
+      </div>
+      <div className="absolute left-0 top-0 z-[2] overflow-hidden rounded-b-[26px]" style={{ width, height: DREAM_SLAB_H * u, ...turn }}>
+        {phone}
+      </div>
     </div>
   );
 };

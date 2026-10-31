@@ -123,6 +123,12 @@ const api = async (req: http.IncomingMessage, res: http.ServerResponse, url: URL
         else return json(res, 400, { error: "unknown action" });
         return json(res, 202, state());
       }
+      case "POST /api/keyboard": {
+        /* the Dream's QWERTY slide: open = landscape */
+        const { open } = (await readBody(req)) as { open?: boolean };
+        await emu.setKeyboard(!!open);
+        return json(res, 200, state());
+      }
       case "POST /api/sensors": {
         const b = (await readBody(req)) as { cable?: Cable; battery?: number; gps?: { lat: number; lon: number; alt: number } };
         if (b.cable) await emu.setCable(b.cable);

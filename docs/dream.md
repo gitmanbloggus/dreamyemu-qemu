@@ -15,6 +15,10 @@ The web UI (`web/`, `npm run dev`) runs it too: Config -> Phone -> Machine
 normal, Recovery (`keys=home+power`) or HBOOT (`keys=power+back`). Typing
 goes to the QWERTY keypad as qcodes, the arrows roll the trackball, F10
 presses it. No audio, adb or WiFi on this machine yet.
+The keyboard button (or F11) slides the keyboard out through the machine's
+`keyboard-open` property (qom-get/qom-set on /machine): the drawn phone
+turns on its side, the screen slab slides up, and the chin stays with the
+clickable QWERTY keyboard. The rotate button turns the closed phone by hand.
 
 ## Run
 
@@ -275,6 +279,12 @@ Rust images' 0xAA fill there the line overflowed a stack buffer.
 - **MDDI list completion** is raised 20 us after PRI_PTR: raised at once,
   the kernel's ISR consumed PRI_LINK_LIST_DONE before the writer enabled
   it, and register writes waited out their timeouts.
+- **PPP rotation on MDP 2.2.** The driver points DST0 at the last 16-pixel
+  tile of a mirrored axis (ROT_90 xor FLIP_LR: + (w - 16) * bpp; FLIP_UD:
+  + (h - 16) rows), because MDP 2.2 writes it from that end. The PPP model
+  undoes it on `mddi` boards. Without that, landscape apps (Teeter's board,
+  its "continue playing?" dialog) landed 304 px right and wrapped 16 px
+  around the left edge. Measured for ROT_90; the flips follow the rule.
 - **Partial updates.** msm_fb sends dirty rectangles: DMA2 IBUF at the
   rectangle, its size, and the panel position in OUT_XY (0x10194).
 - **Keyboard slide** is SW_LID on GPIO 162 (CPLD bit 2, active low);

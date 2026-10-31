@@ -386,6 +386,10 @@ static void dream_key(DreamInput *d, int code, bool down)
     case KEY_ESC:
         code = KEY_BACK;
         break;
+    case KEY_MAIL:
+        /* the @ key (KEY_EMAIL in trout-keypad-v3.kl) has no PC key: qcode "mail" */
+        code = KEY_EMAIL;
+        break;
     case KEY_F1:
         code = KEY_MENU;
         break;
@@ -407,6 +411,20 @@ static void dream_key(DreamInput *d, int code, bool down)
 }
 
 static DreamInput *dream_input;
+
+/* the keyboard slide, for the machine's keyboard-open property (web UI) */
+bool dream_input_keyboard_open(void)
+{
+    return dream_input && dream_input->kbd_open;
+}
+
+void dream_input_set_keyboard_open(bool open)
+{
+    if (dream_input && dream_input->kbd_open != open) {
+        dream_input->kbd_open = open;
+        cpld_set_bit(dream_input, CPLD_BIT_LID, !open);
+    }
+}
 
 static void dream_key_event(DeviceState *dev, QemuConsole *src,
                             QemuInputEvent *evt)

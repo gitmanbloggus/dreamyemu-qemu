@@ -413,6 +413,16 @@ static void dream_init(MachineState *machine)
     }
 }
 
+static bool dream_get_kbd(Object *obj, Error **errp)
+{
+    return dream_input_keyboard_open();
+}
+
+static void dream_set_kbd(Object *obj, bool open, Error **errp)
+{
+    dream_input_set_keyboard_open(open);
+}
+
 static void dream_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -429,6 +439,10 @@ static void dream_machine_class_init(ObjectClass *oc, const void *data)
     mc->no_floppy = true;
     mc->no_parallel = true;
     object_class_property_add_str(oc, "keys", dream_get_keys, dream_set_keys);
+    object_class_property_add_bool(oc, "keyboard-open", dream_get_kbd,
+                                   dream_set_kbd);
+    object_class_property_set_description(oc, "keyboard-open",
+        "The QWERTY keyboard slid out (SW_LID, landscape); F11 toggles it");
     object_class_property_set_description(oc, "keys",
         "Buttons held at power-on, e.g. power+camera (HBOOT), power+home "
         "(recovery), power+back (fastboot)");

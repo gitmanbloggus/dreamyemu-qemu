@@ -39,6 +39,37 @@ export const DREAM_HOTSPOTS: Hotspot[] = [
   { key: "voldown", x: 0, y: 210, w: 14, h: 56, label: "Volume down", side: true },
 ];
 
+/*
+ * Landscape: the portrait frame turned 90 degrees counter-clockwise (the
+ * button chin on the right, as the phone is held with the keyboard out),
+ * and the keyboard drawn under it.  Units as above.
+ */
+export const DREAM_KEYBOARD = { x: 14, w: 560, h: 250 };
+/*
+ * With the keyboard out the screen slab slides away from the chin: the
+ * slab is the portrait frame down to SLAB_H (no chin), and the chin stays
+ * with the keyboard half, at its right, rising past the slab's lower edge
+ * as on the phone.  Landscape units; keys are chin-local.
+ */
+export const DREAM_SLAB_H = 548;
+export const DREAM_KBD_BODY = { x: 14, y: 380, w: 546, h: 270 };
+export const DREAM_CHIN = { x: 560, y: 222, w: 160, h: 428 };
+export const DREAM_CHIN_KEYS: Hotspot[] = [
+  { key: "end", x: 68, y: 22, w: 56, h: 64, label: "End / power (F12)" },
+  { key: "back", x: 68, y: 96, w: 56, h: 64, label: "Back (Esc)" },
+  { key: "trackball", x: 72, y: 178, w: 48, h: 48, label: "Trackball: press F10, roll with the arrow keys" },
+  { key: "menu", x: 18, y: 166, w: 32, h: 72, label: "Menu (F1)" },
+  { key: "home", x: 68, y: 244, w: 56, h: 64, label: "Home" },
+  { key: "call", x: 68, y: 318, w: 56, h: 64, label: "Call (F2)" },
+];
+
+/** The whole drawn phone's box, in frame units */
+export const boxFor = (device: Device, landscape: boolean, keyboard: boolean) => {
+  const f = geometryFor(device).frame;
+  if (device !== "dream" || !landscape) return { w: f.w, h: f.h };
+  return { w: f.h, h: f.w + (keyboard ? DREAM_KEYBOARD.h : 0) };
+};
+
 export const geometryFor = (device: Device) =>
   device === "dream"
     ? { frame: DREAM_FRAME, screen: DREAM_SCREEN, native: { w: 320, h: 480 } }
