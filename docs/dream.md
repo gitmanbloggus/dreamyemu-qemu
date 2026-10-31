@@ -143,8 +143,23 @@ python3 tools/dream_nand.py --erase-aa --spl spl.bin --nbh DREAIMG-RC29.zip \
 Measured with JACxHeroSki 2.2a (system 90 MB, cache 2 MB): the install
 completes, FR-boot writes "Custom MTD written", and the ROM's kernel mounts
 mtdblock3/4/5 (system/cache/userdata) and the SD card (mmcblk0 p1 p2);
-init starts rild (SMD ch 0 opened). After 9 min the screen is still the
-G1 splash with the CPU busy; Android has not drawn yet.
+init starts rild (SMD ch 0 opened), the Hero boot animation plays, and
+after ~8 min (first boot, dexopt) Menu wakes the panel on HTC Sense's lock
+screen (T-Mobile, battery full). com.android.phone force-closes once.
+
+Two modem fixes this needed (`smd-v1` only):
+- **RPCCALL never came up.** The 2.6.29 kernel starts its half of a
+  channel in OPENED, not OPENING, so the modem never sent the router
+  HELLO; every `msm_rpc_connect` failed -113, and `acoustic_open` (htc
+  acoustic, program 0x30100002, now announced too) oopsed on the error
+  pointer: panic, reboot every ~18 s.
+- **Battery.** htc_battery's GET_BATT_INFO (0x30100001 proc 2) got the
+  zeroed default, read as 0% with no charger, and Android powered off at
+  ~70 s (`PCOM_POWER_DOWN`). It now reads 100% on USB.
+
+Its kernel log is at PA 0x103E0000 (128 KiB), not the RC29 one's
+0x102C9000; logcat can be recovered from a RAM dump with the 20-byte
+logger_entry (v1) header. There is no USB/adb on `-M dream` yet.
 
 ### Past the setup wizard
 

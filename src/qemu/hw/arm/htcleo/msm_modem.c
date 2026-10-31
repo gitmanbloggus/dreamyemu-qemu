@@ -879,6 +879,17 @@ static void smd_scan(MsmModemState *s, bool dsp)
         apps_st = smem_rd(s, c.apps + HC_STATE);
         modem_st = smem_rd(s, c.modem + HC_STATE);
 
+        /*
+         * 2.6.29 trout kernels (smd_alloc_channel) start the apps half
+         * straight in OPENED, never OPENING (measured: "SMD: ch 2 CLOSED
+         * -> OPENED" with no open seen here, so RPCCALL never got the
+         * router HELLO and every msm_rpc_connect failed -113).  On smd-v1
+         * treat that like OPENING.
+         */
+        if (s->smd_v1 && apps_st == SMD_SS_OPENED && modem_st != SMD_SS_OPENED) {
+            apps_st = SMD_SS_OPENING;
+        }
+
         switch (apps_st) {
         case SMD_SS_OPENING:
             if (modem_st != SMD_SS_OPENED) {

@@ -63,6 +63,13 @@ static const struct {
     { 0x30000060, 0x00010001, "pm" },
     { 0x30100001, 0x00000000, "htc battery" },
     { 0x30100003, 0x00000000, "htc acoustic" },
+    /*
+     * The Dream's htc_acoustic (trout 2.6.29 kernels, literal at
+     * 0xC004543C before acoustic_open in JACxHeroSki's): unannounced,
+     * msm_rpc_connect fails (-113) and acoustic_open then calls
+     * msm_rpc_call_reply on the error pointer -> oops -> panic, reboot.
+     */
+    { 0x30100002, 0x00000000, "htc acoustic (trout)" },
     { 0x30000064, 0x00010001, "hsusb api" },
     { 0x30000013, 0x00000000, "audmgr" },
     { 0x3000000a, 0x00000000, "adsp rtos" },
@@ -227,11 +234,41 @@ static void prog_default(MsmModemState *s, const RpcMsg *m, RpcReply *r)
     }
 }
 
+/*
+ * The Dream's htc_battery (trout 2.6.29): proc 2, no arguments, is
+ * HTC_PROCEDURE_GET_BATT_INFO, answered with htc_get_batt_info_rep:
+ * batt_id, batt_vol (mV), batt_temp (0.1 C), batt_current (mA), level (%),
+ * charging_source (0 none, 1 USB, 2 AC), charging_enabled, full_bat.
+ * The zeroed default read as an empty battery with no charger, and
+ * Android powered the phone off ~70 s into boot (PCOM_POWER_DOWN,
+ * measured with JACxHeroSki).  Report a full battery on USB.
+ */
+static void prog_htc_battery_v1(MsmModemState *s, const RpcMsg *m,
+                                RpcReply *r)
+{
+    static const uint32_t info[8] = { 1, 4150, 250, 0, 100, 1, 1, 1 };
+
+    if (m->proc != 2) {
+        prog_default(s, m, r);
+        return;
+    }
+    for (int i = 0; i < 8; i++) {
+        put_be32(r, info[i]);
+    }
+}
+
 static void rpc_dispatch(MsmModemState *s, const RpcMsg *m, RpcReply *r)
 {
     switch (m->prog) {
     case 0x30000048:
         prog_time_remote(s, m, r);
+        break;
+    case 0x30100001:
+        if (s->smd_v1) {
+            prog_htc_battery_v1(s, m, r);
+        } else {
+            prog_default(s, m, r);
+        }
         break;
     case 0x3000005b:
         put_be32(r, msm_gps_pdapi_call(s, m->proc, m->args, m->args_len));
