@@ -64,6 +64,12 @@ struct MsmModemState {
     QEMUTimer *rpc_timer;
     uint64_t rpc_calls;
 
+    /* HTC battery (msm_rpc.c): settable at run time with qom-set */
+    uint32_t batt_level;        /* percent */
+    uint32_t batt_charger;      /* 0 none, 1 USB, 2 AC */
+    uint32_t batt_sent_level, batt_sent_charger;
+    QEMUTimer *batt_timer;
+
     /* QDSP6 (msm_qdsp6.c) */
     AudioBackend *audio_be;
 

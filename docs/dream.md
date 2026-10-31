@@ -122,6 +122,29 @@ data-area ECC — the msm-nand model treats parity as zero and never checks
 it, so edits read back verbatim in the emulator but would fail a real
 controller.
 
+## Battery
+
+`htc_battery` asks the modem's RPC program `0x30100001` for the battery
+(`GET_BATT_INFO`) and serves `0x30100000` for AMSS's unasked updates.
+msm-modem answers with a level, a voltage that follows it, 28.0 C, and the
+charger, and calls the kernel's cable/level procedures when they change.
+Defaults: 85 %, on USB. Change them while it runs, from the monitor:
+
+```
+qom-set /machine/modem batt-level 12
+qom-set /machine/modem batt-charger 0      # 0 none, 1 USB, 2 AC
+```
+
+The kernel picks the change up within about 2 s. Measured: 12 % with no
+charger brings up Android's "Please connect charger" dialog. At 0 % on
+battery Android powers the phone off, as it would on the real phone.
+
+![Low-battery warning after qom-set](dream-battery.png)
+
+The RPC router only started once smd-v1 channels that open straight to
+OPENED (2.6.25 skips OPENING) ran the open hooks too. Before that the
+kernel kept its built-in defaults and showed "Charging (100%)".
+
 ## Buttons, HBOOT and recovery keys
 
 `-M dream,keys=power+back` holds a combo from power-on (3 s): the SPL

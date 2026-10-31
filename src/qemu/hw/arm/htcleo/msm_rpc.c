@@ -219,6 +219,75 @@ static void prog_time_remote(MsmModemState *s, const RpcMsg *m, RpcReply *r)
     }
 }
 
+/*
+ * htc_battery (2.6.25 trout) calls the modem's 0x30100001 for the battery
+ * and serves 0x30100000 for AMSS's updates.  Measured: answered with
+ * zeroes, GET_BATT_INFO read 0 % on battery and Android powered the phone
+ * off (proc_comm POWER_DOWN) a few seconds after boot.
+ */
+#define HTC_BATT_PROG           0x30100001
+#define HTC_GET_BATT_LEVEL      1
+#define HTC_GET_BATT_INFO       2
+#define HTC_GET_CABLE_STATUS    3
+#define BATT_MTOA_PROG          0x30100000
+#define BATT_MTOA_CABLE_STATUS  2
+#define BATT_MTOA_LEVEL_UPDATE  3
+#define BATT_POLL_NS            (2 * NANOSECONDS_PER_SECOND)
+
+static uint32_t batt_level(MsmModemState *s)
+{
+    return MIN(s->batt_level, 100);
+}
+
+static void prog_htc_battery(MsmModemState *s, const RpcMsg *m, RpcReply *r)
+{
+    uint32_t level = batt_level(s), src = MIN(s->batt_charger, 2);
+
+    switch (m->proc) {
+    case HTC_GET_BATT_LEVEL:
+        put_be32(r, level);
+        break;
+    case HTC_GET_BATT_INFO:     /* struct battery_info_reply */
+        put_be32(r, 1);                         /* batt_id */
+        put_be32(r, 3600 + level * 6);          /* batt_vol, mV */
+        put_be32(r, 280);                       /* batt_temp, 0.1 C */
+        put_be32(r, src && level < 100 ? 400 : 0);  /* batt_current, mA */
+        put_be32(r, level);
+        put_be32(r, src);                       /* charging_source */
+        put_be32(r, src && level < 100);        /* charging_enabled */
+        put_be32(r, 1150);                      /* full_bat, mAh */
+        break;
+    case HTC_GET_CABLE_STATUS:
+        put_be32(r, src);
+        break;
+    default:                    /* NULL, SET_BATT_DELTA, CHARGER_SWITCH */
+        put_be32(r, 0);
+        break;
+    }
+}
+
+/* push qom-set changes to the kernel the way AMSS does, unasked */
+static void batt_poll(void *opaque)
+{
+    MsmModemState *s = opaque;
+    uint32_t arg;
+
+    if (s->batt_charger != s->batt_sent_charger) {
+        s->batt_sent_charger = s->batt_charger;
+        arg = cpu_to_be32(MIN(s->batt_charger, 2));
+        msm_rpc_apps_call(s, BATT_MTOA_PROG, 0, BATT_MTOA_CABLE_STATUS,
+                          &arg, 1);
+    }
+    if (batt_level(s) != s->batt_sent_level) {
+        s->batt_sent_level = batt_level(s);
+        arg = cpu_to_be32(s->batt_sent_level);
+        msm_rpc_apps_call(s, BATT_MTOA_PROG, 0, BATT_MTOA_LEVEL_UPDATE,
+                          &arg, 1);
+    }
+    timer_mod(s->batt_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              BATT_POLL_NS);
+}
+
 static void prog_default(MsmModemState *s, const RpcMsg *m, RpcReply *r)
 {
     /* success with a zeroed result block */
@@ -235,6 +304,9 @@ static void rpc_dispatch(MsmModemState *s, const RpcMsg *m, RpcReply *r)
         break;
     case 0x3000005b:
         put_be32(r, msm_gps_pdapi_call(s, m->proc, m->args, m->args_len));
+        break;
+    case HTC_BATT_PROG:
+        prog_htc_battery(s, m, r);
         break;
     default:
         prog_default(s, m, r);
@@ -567,6 +639,10 @@ void msm_modem_rpc_reset(MsmModemState *s)
     s->rpc_calls = 0;
     g_hash_table_remove_all(s->rpc_frag);
     timer_del(s->rpc_timer);
+    s->batt_sent_level = batt_level(s);
+    s->batt_sent_charger = s->batt_charger;
+    timer_mod(s->batt_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              BATT_POLL_NS);
 }
 
 void msm_modem_rpc_init(MsmModemState *s)
@@ -577,6 +653,7 @@ void msm_modem_rpc_init(MsmModemState *s)
     s->rpc_frag = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
                                         (GDestroyNotify)g_byte_array_unref);
     s->rpc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rpc_hello_timer, s);
+    s->batt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, batt_poll, s);
     for (size_t i = 0; i < ARRAY_SIZE(modem_programs); i++) {
         RpcServer sv = {
             .prog = modem_programs[i].prog,
