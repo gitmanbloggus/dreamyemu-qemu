@@ -175,6 +175,31 @@ Open: after the data call, rild answers some `SIGNAL_STRENGTH` and
 `SCREEN_STATE` requests with RADIO_NOT_AVAILABLE for a while (seen in
 logcat; data keeps working). No voice calls or SMS yet.
 
+## Custom recovery
+
+```bash
+cp images/dream_data.img images/dream_ra.img
+python3 tools/dream_flash.py images/dream_ra.img recovery recovery-RA-dream-v1.7.0.img
+src/qemu/build/qemu-system-arm -M dream,keys=power+home -bios spl.bin \
+    -drive if=mtd,format=raw,file=images/dream_ra.img \
+    -drive if=sd,format=raw,file=images/sdcard.img -display sdl
+```
+
+`dream_flash.py` erases a partition (recovery, boot, misc) and programs an
+image into it, as `fastboot flash` would.
+
+Measured with Amon_RA's RA-dream v1.7.0, which brings its own, newer
+kernel:
+- The menu comes up, and keyboard shortcuts work (Alt+F, Alt+W, Alt+B …,
+  HOME to confirm). The trackball does not move the selection yet.
+- "Flash zip from sdcard" reads the SD card.
+- "Wipe cache" erases and formats the partition.
+- "Nand backup" writes boot, system, data and cache with an MD5 list to
+  `/sdcard/nandroid/`. The `boot.img` it dumped is byte-identical to the
+  RC29 boot image in the NBH, and its MD5 matches RA's.
+
+![RA-dream v1.7.0](promo/ra-recovery.png) ![Nandroid backup](promo/ra-nandroid.png)
+
 ## microSD
 
 ```bash
