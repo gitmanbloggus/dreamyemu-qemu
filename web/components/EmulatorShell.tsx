@@ -9,8 +9,8 @@ import { DevicePanel, stateColor } from "@/components/panels/DevicePanel";
 import { LogsPanel } from "@/components/panels/LogsPanel";
 import { SensorsPanel } from "@/components/panels/SensorsPanel";
 import { api, useAudio, useControl, useVideo } from "@/lib/client";
-import { FRAME, SCREEN } from "@/lib/frame-geometry";
-import type { EmulatorConfig, HardKey, ServerState } from "@/lib/emulator-types";
+import { geometryFor } from "@/lib/frame-geometry";
+import { codeToQcode, type EmulatorConfig, type HardKey, type ServerState } from "@/lib/emulator-types";
 
 const TABS = ["Device", "Config", "Sensors", "Logs"] as const;
 type Tab = (typeof TABS)[number];
@@ -40,7 +40,7 @@ const ADB_KEYS: Record<string, number> = {
 };
 
 const RESTART_FIELDS: (keyof EmulatorConfig)[] = [
-  "baseband", "dsp", "usb", "nand", "sdcard", "boot", "gpu", "audio", "wifi", "mobileData", "adbPort", "amssLog", "dspShift", "extraArgs",
+  "device", "baseband", "dsp", "usb", "nand", "sdcard", "boot", "gpu", "audio", "wifi", "mobileData", "adbPort", "amssLog", "dspShift", "extraArgs",
 ];
 
 const AppIcon = () => (
@@ -94,6 +94,10 @@ const EmulatorShell = () => {
 
   const state = status?.state ?? "stopped";
   const running = state === "running";
+  /* what is on screen: the running machine, else the one that would start */
+  const device = status?.running?.device ?? config?.device ?? "hd2";
+  const geo = geometryFor(device);
+  const phone = device === "dream" ? "HTC Dream" : "HD2";
   const hasPicture = running && !!status && video.lastFrameAt >= status.since;
 
   useEffect(() => {
@@ -102,15 +106,16 @@ const EmulatorShell = () => {
     const fit = () => {
       const r = el.getBoundingClientRect();
       const pad = r.width < 640 ? 16 : 40;
-      const byH = ((r.height - pad * 2) * FRAME.w) / FRAME.h;
+      const { frame, screen, native } = geometryFor(device);
+      const byH = ((r.height - pad * 2) * frame.w) / frame.h;
       const fitted = Math.max(200, Math.min(r.width - pad * 2, byH));
-      setFrameW(zoom === "1:1" ? (480 / SCREEN.w) * FRAME.w : fitted);
+      setFrameW(zoom === "1:1" ? (native.w / screen.w) * frame.w : fitted);
     };
     fit();
     const ro = new ResizeObserver(fit);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [zoom]);
+  }, [zoom, device]);
 
   const onKey = useCallback(
     (k: HardKey, down: boolean) => {
@@ -150,11 +155,21 @@ const EmulatorShell = () => {
 
   const onStageKey = (e: React.KeyboardEvent, down: boolean) => {
     if (!running) return;
-    const hk = KEYMAP[e.key];
+    const hk = KEYMAP[e.key] ?? (device === "dream" && e.key === "End" ? "end" : device === "dream" && e.key === "F10" ? "trackball" : undefined);
     if (hk) {
       e.preventDefault();
       if (e.repeat) return;
       onKey(hk, down);
+      return;
+    }
+    if (device === "dream") {
+      /* the Dream's own QWERTY keypad (and the trackball on the arrows): keys go straight to it */
+      if (e.ctrlKey || e.metaKey) return;
+      const q = codeToQcode(e.code);
+      if (!q) return;
+      e.preventDefault();
+      if (e.repeat && !/^(up|down|left|right|backspace)$/.test(q)) return;
+      send({ t: "qkey", q, d: down });
       return;
     }
     if (!down || e.ctrlKey || e.metaKey || e.altKey) return;
@@ -217,8 +232,8 @@ const EmulatorShell = () => {
         <span className="text-[17px] font-light text-holo-text">{state === "crashed" ? "Stopped with an error" : "Powered off"}</span>
         {config && (
           <span className="max-w-[80%] text-[13px] text-holo-text-3">
-            {config.baseband === "lle" ? "Real AMSS" : "Modelled baseband"}
-            {config.dsp === "lle" ? " + real DSP" : ""} · {config.nand}
+            {config.device === "dream" ? "HTC Dream" : config.baseband === "lle" ? "Real AMSS" : "Modelled baseband"}
+            {config.device !== "dream" && config.dsp === "lle" ? " + real DSP" : ""} · {config.nand}
           </span>
         )}
       </div>
@@ -229,7 +244,7 @@ const EmulatorShell = () => {
       <header className="relative z-20 flex h-14 shrink-0 items-center gap-3 bg-holo-bar px-3 shadow-[0_2px_6px_rgba(0,0,0,0.7)]">
         <AppIcon />
         <div className="min-w-0 flex-1 leading-tight">
-          <h1 className="truncate text-[19px] font-normal">HD2 Emulator</h1>
+          <h1 className="truncate text-[19px] font-normal">{phone} Emulator</h1>
           <div className="flex items-center gap-1.5 text-[12.5px] text-holo-text-3">
             <span className="size-2 rounded-full" style={{ background: stateColor(state) }} />
             {connected ? (status ? state[0].toUpperCase() + state.slice(1) : "…") : "Reconnecting to the server"}
@@ -244,7 +259,7 @@ const EmulatorShell = () => {
           >
             {audio.enabled ? <Volume2 size={22} strokeWidth={1.6} /> : <VolumeX size={22} strokeWidth={1.6} />}
           </ActionButton>
-          <ActionButton label={zoom === "fit" ? "Show at 100% (480 × 800)" : "Fit to window"} onClick={() => setZoom(zoom === "fit" ? "1:1" : "fit")}>
+          <ActionButton label={zoom === "fit" ? `Show at 100% (${geo.native.w} × ${geo.native.h})` : "Fit to window"} onClick={() => setZoom(zoom === "fit" ? "1:1" : "fit")}>
             {zoom === "fit" ? <Minimize2 size={21} strokeWidth={1.6} /> : <Maximize2 size={21} strokeWidth={1.6} />}
           </ActionButton>
           <a
@@ -270,7 +285,7 @@ const EmulatorShell = () => {
             ref={focusTarget}
             tabIndex={0}
             role="application"
-            aria-label="Emulated HD2. Click the screen to touch; keyboard shortcuts and typing go to the phone."
+            aria-label={`Emulated ${phone}. Click the screen to touch; keyboard shortcuts and typing go to the phone.`}
             className="outline-none"
             onKeyDown={(e) => onStageKey(e, true)}
             onKeyUp={(e) => onStageKey(e, false)}
@@ -278,6 +293,7 @@ const EmulatorShell = () => {
           >
             {frameW > 0 && (
               <DeviceFrame
+                device={device}
                 width={frameW}
                 canvasRef={canvas}
                 send={send}
@@ -315,7 +331,7 @@ const EmulatorShell = () => {
           </nav>
           <div className="min-h-0 flex-1 overflow-y-auto">
             {tab === "Device" && (
-              <DevicePanel status={status} pressed={pressed} onKey={onKey} onPower={power} onType={typeText} video={video} />
+              <DevicePanel device={device} status={status} pressed={pressed} onKey={onKey} onPower={power} onType={typeText} video={video} />
             )}
             {tab === "Config" && config && server && (
               <ConfigPanel config={config} images={server.images} firmware={server.firmware} onChange={saveConfig} />

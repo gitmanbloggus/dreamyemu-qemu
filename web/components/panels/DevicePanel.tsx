@@ -3,7 +3,19 @@
 import { useState } from "react";
 import { Camera, Power, RefreshCw, RotateCcw, Send, Square } from "lucide-react";
 import { Category, HoloButton, PrefRow } from "@/components/holo";
-import type { EmulatorStatus, HardKey } from "@/lib/emulator-types";
+import type { Device, EmulatorStatus, HardKey } from "@/lib/emulator-types";
+
+/* the Dream: End is also power; the trackball presses on F10 and rolls on the arrows */
+const DREAM_KEYS: { key: HardKey; label: string; hint: string }[] = [
+  { key: "call", label: "Call", hint: "F2" },
+  { key: "home", label: "Home", hint: "Home" },
+  { key: "menu", label: "Menu", hint: "F1" },
+  { key: "back", label: "Back", hint: "Esc" },
+  { key: "end", label: "End / power", hint: "F12" },
+  { key: "trackball", label: "Trackball", hint: "F10" },
+  { key: "volup", label: "Volume +", hint: "PgUp" },
+  { key: "voldown", label: "Volume −", hint: "PgDn" },
+];
 
 const KEYS: { key: HardKey; label: string; hint: string }[] = [
   { key: "call", label: "Call", hint: "F2" },
@@ -36,12 +48,14 @@ const uptime = (since: number) => {
 const modeLine = (st: EmulatorStatus) => {
   const r = st.running;
   if (!r) return st.external ? "Started outside the web UI" : "";
+  if (r.device === "dream") return `HTC Dream, ${r.nand}${r.sdcard ? ` + ${r.sdcard}` : ""}`;
   const bb = r.baseband === "lle" ? "Real AMSS baseband" : "Modelled baseband";
   const dsp = r.dsp === "lle" ? ", real DSP1 on Hexagon" : "";
   return `${bb}${dsp}, ${r.nand}${r.sdcard ? ` + ${r.sdcard}` : ""}`;
 };
 
 type Props = {
+  device: Device;
   status: EmulatorStatus | null;
   pressed: Set<HardKey>;
   onKey: (k: HardKey, down: boolean) => void;
@@ -50,7 +64,8 @@ type Props = {
   video: { fps: number; decodeMs: number; mode: string; codec: string };
 };
 
-export const DevicePanel = ({ status, pressed, onKey, onPower, onType, video }: Props) => {
+export const DevicePanel = ({ device, status, pressed, onKey, onPower, onType, video }: Props) => {
+  const dream = device === "dream";
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const st = status?.state ?? "stopped";
@@ -114,7 +129,7 @@ export const DevicePanel = ({ status, pressed, onKey, onPower, onType, video }: 
 
       <Category>Hardware keys</Category>
       <div className="grid grid-cols-4 gap-2 px-4 py-2">
-        {KEYS.map((k) => (
+        {(dream ? DREAM_KEYS : KEYS).map((k) => (
           <button
             key={k.key}
             type="button"
@@ -134,10 +149,21 @@ export const DevicePanel = ({ status, pressed, onKey, onPower, onType, video }: 
         ))}
       </div>
       <p className="px-4 pt-1 text-[12.5px] leading-5 text-holo-text-3">
-        Hold a key to long-press it. With the screen focused, the keyboard shortcuts work too, and typed text goes to Android
-        over adb.
+        {dream
+          ? "Hold a key to long-press it. With the screen focused, typing goes to the Dream's QWERTY keypad (Alt and Shift too), the arrow keys roll the trackball and F11 slides the keyboard out."
+          : "Hold a key to long-press it. With the screen focused, the keyboard shortcuts work too, and typed text goes to Android over adb."}
       </p>
 
+      {dream ? (
+        <>
+          <Category>About</Category>
+          <PrefRow
+            title="HTC Dream / T-Mobile G1 (dream) on QEMU"
+            summary="Qualcomm MSM7201A, ARM1136 528 MHz, 3.2-inch 320 × 480 panel over MDDI. Its SPL boots the NAND; see docs/dream.md."
+          />
+        </>
+      ) : (
+      <>
       <Category>Type into Android</Category>
       <form
         className="flex items-end gap-3 px-4 py-3"
@@ -178,6 +204,8 @@ export const DevicePanel = ({ status, pressed, onKey, onPower, onType, video }: 
           </>
         }
       />
+      </>
+      )}
     </div>
   );
 };

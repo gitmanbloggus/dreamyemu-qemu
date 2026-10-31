@@ -1,10 +1,23 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { FRAME, HOTSPOTS, POWER, SCREEN, pct } from "@/lib/frame-geometry";
-import type { HardKey, InputMessage } from "@/lib/emulator-types";
+import { DREAM_HOTSPOTS, HOTSPOTS, POWER, geometryFor, pct } from "@/lib/frame-geometry";
+import type { Device, HardKey, InputMessage } from "@/lib/emulator-types";
+
+/* Dream key caps: green Call, red End, a pearl trackball, the rest graphite */
+const DREAM_KEY_STYLE: Partial<Record<HardKey, string>> = {
+  call: "rounded-[10px] bg-gradient-to-b from-[#2f6b35] to-[#1b3f1f]",
+  end: "rounded-[10px] bg-gradient-to-b from-[#7a2626] to-[#461414]",
+  home: "rounded-[10px] bg-gradient-to-b from-[#3a3a3a] to-[#1c1c1c]",
+  back: "rounded-[10px] bg-gradient-to-b from-[#3a3a3a] to-[#1c1c1c]",
+  menu: "rounded-[8px] bg-gradient-to-b from-[#3a3a3a] to-[#1c1c1c]",
+  trackball: "rounded-full bg-[radial-gradient(circle_at_35%_30%,#f4f4f4,#9a9a9a_60%,#5c5c5c)]",
+  volup: "rounded-l-[4px] bg-[#2a2a2a]",
+  voldown: "rounded-l-[4px] bg-[#2a2a2a]",
+};
 
 type Props = {
+  device: Device;
   width: number;
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
   send: (m: InputMessage) => void;
@@ -14,7 +27,9 @@ type Props = {
   onKey: (k: HardKey, down: boolean) => void;
 };
 
-export const DeviceFrame = ({ width, canvasRef, send, interactive, overlay, pressed, onKey }: Props) => {
+export const DeviceFrame = ({ device, width, canvasRef, send, interactive, overlay, pressed, onKey }: Props) => {
+  const { frame: FRAME, screen: SCREEN, native } = geometryFor(device);
+  const dream = device === "dream";
   const down = useRef(false);
   const pending = useRef<{ x: number; y: number } | null>(null);
   const raf = useRef(0);
@@ -72,19 +87,29 @@ export const DeviceFrame = ({ width, canvasRef, send, interactive, overlay, pres
 
   return (
     <div className="relative select-none" style={{ width, height: (width * FRAME.h) / FRAME.w }}>
-      <button
-        type="button"
-        aria-label="Power"
-        title="Power (F12)"
-        data-down={pressed.has("power")}
-        className="absolute z-0 rounded-t-[6px] bg-gradient-to-b from-[#3a3a3a] to-[#111] shadow-[inset_0_1px_0_rgba(255,255,255,0.18)] transition-transform data-[down=true]:translate-y-[2px] data-[down=true]:shadow-[0_0_14px_rgba(51,181,229,0.6)]"
-        style={{ left: pct(POWER.x, FRAME.w), top: pct(POWER.y, FRAME.h), width: pct(POWER.w, FRAME.w), height: pct(POWER.h, FRAME.h) }}
-        {...keyHandlers("power")}
-      />
+      {dream ? (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute z-0 rounded-[9%/5%] bg-gradient-to-b from-[#2b2b2d] via-[#1a1a1b] to-[#101011] shadow-[inset_0_1px_0_rgba(255,255,255,0.12),0_10px_40px_rgba(0,0,0,0.6)]"
+          style={{ left: pct(10, FRAME.w), top: 0, right: 0, bottom: 0 }}
+        >
+          <span className="absolute left-1/2 top-[3.2%] h-[0.6%] w-[16%] -translate-x-1/2 rounded-full bg-[#050505]" />
+        </div>
+      ) : (
+        <button
+          type="button"
+          aria-label="Power"
+          title="Power (F12)"
+          data-down={pressed.has("power")}
+          className="absolute z-0 rounded-t-[6px] bg-gradient-to-b from-[#3a3a3a] to-[#111] shadow-[inset_0_1px_0_rgba(255,255,255,0.18)] transition-transform data-[down=true]:translate-y-[2px] data-[down=true]:shadow-[0_0_14px_rgba(51,181,229,0.6)]"
+          style={{ left: pct(POWER.x, FRAME.w), top: pct(POWER.y, FRAME.h), width: pct(POWER.w, FRAME.w), height: pct(POWER.h, FRAME.h) }}
+          {...keyHandlers("power")}
+        />
+      )}
       <canvas
         ref={canvasRef}
-        width={480}
-        height={800}
+        width={native.w}
+        height={native.h}
         className={`absolute z-[1] touch-none bg-black ${interactive ? "cursor-crosshair" : ""}`}
         style={{
           left: pct(SCREEN.x - 2, FRAME.w),
@@ -115,21 +140,27 @@ export const DeviceFrame = ({ width, canvasRef, send, interactive, overlay, pres
           {overlay}
         </div>
       )}
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img
-        src="/hd2-frame.webp"
-        alt="HTC HD2"
-        draggable={false}
-        className="pointer-events-none absolute inset-0 z-[4] h-full w-full"
-      />
-      {HOTSPOTS.map((h) => (
+      {!dream && (
+        /* eslint-disable-next-line @next/next/no-img-element */
+        <img
+          src="/hd2-frame.webp"
+          alt="HTC HD2"
+          draggable={false}
+          className="pointer-events-none absolute inset-0 z-[4] h-full w-full"
+        />
+      )}
+      {(dream ? DREAM_HOTSPOTS : HOTSPOTS).map((h) => (
         <button
           key={h.key}
           type="button"
           aria-label={h.label}
           title={h.label}
           data-down={pressed.has(h.key)}
-          className={`hd2-key absolute z-[5] touch-none ${h.side ? "rounded-[6px]" : ""}`}
+          className={
+            dream
+              ? `absolute z-[5] touch-none shadow-[inset_0_1px_0_rgba(255,255,255,0.15)] transition data-[down=true]:brightness-150 data-[down=true]:shadow-[0_0_14px_rgba(51,181,229,0.6)] ${DREAM_KEY_STYLE[h.key] ?? ""}`
+              : `hd2-key absolute z-[5] touch-none ${h.side ? "rounded-[6px]" : ""}`
+          }
           style={{ left: pct(h.x, FRAME.w), top: pct(h.y, FRAME.h), width: pct(h.w, FRAME.w), height: pct(h.h, FRAME.h) }}
           {...keyHandlers(h.key)}
         />

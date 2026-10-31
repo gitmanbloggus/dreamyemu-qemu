@@ -9,6 +9,13 @@ this is where that work continues.
 
 Board: `src/qemu/hw/arm/dream/` (`dream.c`, `msm_mddi.c`).
 
+The web UI (`web/`, `npm run dev`) runs it too: Config -> Phone -> Machine
+"HTC Dream" (needs `images/spl.bin`). Dream NANDs are told apart by size
+(2048 x 64 x 2112 bytes), SD cards by a `sdcard*` or `*_sd*` name. Boot:
+normal, Recovery (`keys=home+power`) or HBOOT (`keys=power+back`). Typing
+goes to the QWERTY keypad as qcodes, the arrows roll the trackball, F10
+presses it. No audio, adb or WiFi on this machine yet.
+
 ## Run
 
 Third-party blobs stay out of git (`images/` is ignored): the 512 KiB SPL

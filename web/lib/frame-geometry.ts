@@ -1,4 +1,4 @@
-import type { HardKey } from "./emulator-types";
+import type { Device, HardKey } from "./emulator-types";
 
 /* Positions in public/hd2-frame.webp (1165 x 2045), measured on the photo. */
 export const FRAME = { w: 1165, h: 2045 };
@@ -20,3 +20,26 @@ export const HOTSPOTS: Hotspot[] = [
 export const POWER = { x: 820, y: 2, w: 150, h: 30 };
 
 export const pct = (v: number, of: number) => `${(v / of) * 100}%`;
+
+/*
+ * The Dream has no photo: DreamFrame draws the body.  Units are screen
+ * pixels (320 x 480).  Below the screen, as on the phone: Call, Home, the
+ * trackball, Back, End, with Menu above the trackball; volume on the left.
+ */
+export const DREAM_FRAME = { w: 400, h: 720 };
+export const DREAM_SCREEN = { x: 40, y: 56, w: 320, h: 480 };
+export const DREAM_HOTSPOTS: Hotspot[] = [
+  { key: "call", x: 30, y: 600, w: 62, h: 50, label: "Call (F2)" },
+  { key: "home", x: 100, y: 600, w: 62, h: 50, label: "Home" },
+  { key: "menu", x: 170, y: 552, w: 60, h: 30, label: "Menu (F1)" },
+  { key: "trackball", x: 176, y: 594, w: 48, h: 48, label: "Trackball: press F10, roll with the arrow keys" },
+  { key: "back", x: 238, y: 600, w: 62, h: 50, label: "Back (Esc)" },
+  { key: "end", x: 308, y: 600, w: 62, h: 50, label: "End / power (F12)" },
+  { key: "volup", x: 0, y: 150, w: 14, h: 56, label: "Volume up", side: true },
+  { key: "voldown", x: 0, y: 210, w: 14, h: 56, label: "Volume down", side: true },
+];
+
+export const geometryFor = (device: Device) =>
+  device === "dream"
+    ? { frame: DREAM_FRAME, screen: DREAM_SCREEN, native: { w: 320, h: 480 } }
+    : { frame: FRAME, screen: SCREEN, native: { w: 480, h: 800 } };
