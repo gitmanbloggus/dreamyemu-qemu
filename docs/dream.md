@@ -83,6 +83,24 @@ or the mouse wheel (vertical), press with the middle button or F10.
 Measured: tapping the android, the tip and "Next" walks the setup wizard
 to its account page; trackball Down + press opens the Emergency Dialer.
 
+### Custom recovery (RA-dream)
+
+`--recovery IMG` / `--boot IMG` write a boot image into that partition
+(after `--nbh`, so they override it) and erase the rest of it, as
+`fastboot flash` would. With RA-dream v1.7.0 (md5
+`4b9f198aa8ada3ca1ed5537e9c25e427`):
+
+```bash
+python3 tools/dream_nand.py --erase-aa --spl spl.bin --nbh DREAIMG-RC29.zip \
+    --recovery recovery-RA-dream-v1.7.0.img nand_bringup.img images/dream_nand_ra.img
+src/qemu/build/qemu-system-arm -M dream,keys=home+power -bios spl.bin \
+    -drive if=mtd,format=raw,file=images/dream_nand_ra.img -display sdl
+```
+
+Measured: Home+Power reaches RA's menu ("Build : RA-dream-v1.7.0") within
+25-75 s of power-on. Its "Flash zip from sdcard" needs the SD card, which
+is not modeled yet.
+
 ### Past the setup wizard
 
 RC29's wizard needs a Google account to continue, so an offline image is
