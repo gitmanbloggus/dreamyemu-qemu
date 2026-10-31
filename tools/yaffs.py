@@ -29,8 +29,10 @@ back as written in the emulator.  It would fail a real controller's ECC.
 `set-provisioned` is the reason this exists: Android 1.0 (RC29) sits on the
 "Welcome to T-Mobile G1" wizard until a Google account is added, with no way
 forward offline.  The wizard gates on Settings DEVICE_PROVISIONED, stored in
-/data/data/com.android.providers.settings/databases/settings.db.  This flips
-it to 1 so the next boot goes straight to the home screen.  /data is empty in
+/data/data/com.android.providers.settings/databases/settings.db, and the
+wizard is a HOME activity until it disables itself.  This renames
+/system/app/SetupWizard.apk and sets the flag to 1, so the next boot goes
+to the keyguard and then the Launcher.  /data is empty in
 a fresh image, so the database only exists after one boot: boot the image
 once (write to a working copy, no snapshot, so /data persists), let it reach
 the wizard, power off, then run this on that copy.
@@ -39,6 +41,7 @@ Usage:
     python3 tools/yaffs.py IMG --part userdata list
     python3 tools/yaffs.py IMG --part userdata extract /path/to/file OUT
     python3 tools/yaffs.py IMG --part userdata replace /path/to/file IN
+    python3 tools/yaffs.py IMG --part system rename /path/to/file NEWNAME
     python3 tools/yaffs.py IMG set-provisioned
 """
 
@@ -47,8 +50,10 @@ import struct
 import sys
 import tempfile
 
-SETTINGS_DB = ("/data/data/com.android.providers.settings/"
+SETTINGS_DB = ("/data/com.android.providers.settings/"  # partition-relative
                "databases/settings.db")
+
+WIZARD = "/app/SetupWizard.apk"     # in the system partition
 
 PAGE = 2048
 SPARE = 64
@@ -63,6 +68,22 @@ PARTS = {
 
 # YAFFS reserved object ids (a file whose parent chain hits these is not live)
 ROOT, LOSTFOUND, UNLINKED, DELETED = 1, 2, 3, 4
+
+
+EXTRA_HEADER = 0x80000000      # yaffs_packedtags2.c EXTRA_HEADER_INFO_FLAG
+
+
+def tags(img, off):
+    """(seq, objId, chunkId, byteCount) from packed tags at img[off].
+
+    A running kernel marks header chunks with EXTRA_HEADER in chunkId (the
+    low bits are then the parent's objId) and keeps the object type in
+    objId's top 4 bits; mkyaffs2image writes neither."""
+    seq, obj, chunk, n = struct.unpack_from("<4I", img, off)
+    if chunk & EXTRA_HEADER:
+        obj &= 0x0FFFFFFF
+        chunk = 0
+    return seq, obj, chunk, n
 
 
 def u32(b, o):
@@ -82,7 +103,7 @@ class Yaffs:
             sp = rec * REC + PAGE
             if sp + 16 > len(img):
                 break
-            seq, obj, chunk, _ = struct.unpack_from("<4I", img, sp)
+            seq, obj, chunk, _ = tags(img, sp)
             if obj in (0, 0xFFFFFFFF) or seq in (0, 0xFFFFFFFF):
                 continue
             if chunk == 0:
@@ -229,7 +250,7 @@ def plausible_tags(img, start, end, conv):
         if page == b"\xff" * REC:
             continue
         lin = conv(page) if conv else page
-        seq, obj, chunk, n = struct.unpack_from("<4I", lin, PAGE)
+        seq, obj, chunk, n = tags(lin, PAGE)
         seen += 1
         good += (0x1000 <= seq < 0x1000000 and 0 < obj < 0x40000
                  and chunk < 0x40000 and (n <= PAGE or n == 0xFFFF))
@@ -269,6 +290,21 @@ def load(path):
                 out[a:b] = linear_to_cw(raw[a:b], img[a:b])
         return bytes(out)
     return lin, save
+
+
+def rename(fs, path, name):
+    """Rename an object in place: rewrite the name in its newest header
+    chunk (data[10:265]); the parent, the spare and the size stay as they
+    were, so the kernel sees the new name on its next scan."""
+    obj, info = fs.find(path)
+    if obj is None:
+        raise SystemExit(f"not found: {path}")
+    raw = name.encode("latin1")
+    if not 0 < len(raw) <= 255 or b"/" in raw:
+        raise SystemExit(f"bad name {name!r}")
+    b = info["rec"] * REC + 10
+    fs.img[b:b + 256] = raw.ljust(256, b"\0")
+    return obj
 
 
 def open_part(path, part):
@@ -331,6 +367,16 @@ def set_provisioned_db(path):
 def main(argv):
     if len(argv) >= 3 and argv[2] == "set-provisioned":
         path = argv[1]
+        # RC29's wizard is a HOME activity of its own and only disables
+        # itself when it finishes, so device_provisioned alone leaves it
+        # behind the keyguard (measured).  PackageManager scans only *.apk,
+        # so a renamed SetupWizard.apk is gone on the next boot and the
+        # Launcher is the only home.
+        img, save, fs = open_part(path, "system")
+        if fs.find(WIZARD)[0] is not None:
+            rename(fs, WIZARD, WIZARD.rsplit("/", 1)[1] + ".off")
+            open(path, "wb").write(save(img))
+            print(f"renamed {WIZARD} -> {WIZARD}.off")
         img, save, fs = open_part(path, "userdata")
         obj, info = fs.find(SETTINGS_DB)
         if obj is None:
@@ -381,6 +427,12 @@ def main(argv):
         fs.replace_file(obj, new)
         open(path, "wb").write(save(img))
         print(f"replaced {argv[5]} ({info['size']} -> {len(new)} B) in {path}")
+        return 0
+
+    if cmd == "rename":
+        rename(fs, argv[5], argv[6])
+        open(path, "wb").write(save(img))
+        print(f"renamed {argv[5]} -> {argv[6]} in {path}")
         return 0
 
     raise SystemExit(f"unknown command {cmd!r}")

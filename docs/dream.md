@@ -86,29 +86,41 @@ to its account page; trackball Down + press opens the Emergency Dialer.
 ### Past the setup wizard
 
 RC29's wizard needs a Google account to continue, so an offline image is
-stuck at "Welcome to T-Mobile G1". The wizard gates on the Settings
-`device_provisioned` flag in `/data`, so flip it offline and the next boot
-goes to the home screen. `/data` is empty in a fresh image, so the
-settings database only exists after one boot:
+stuck at "Welcome to T-Mobile G1". It is a home activity of its own that
+only disables itself when it finishes, so getting past it takes two edits:
+rename `/system/app/SetupWizard.apk` (PackageManager loads only `*.apk`)
+and set Settings `device_provisioned` in `/data`. `/data` is empty in a
+fresh image, so the settings database only exists after one boot:
 
 ```bash
 cp images/dream_nand_boot.img images/dream_data.img          # a working copy
 src/qemu/build/qemu-system-arm -M dream -bios spl.bin \
     -drive if=mtd,format=raw,file=images/dream_data.img       # no snapshot
 #   ... let it reach the wizard (~30 s), then power off ...
-python3 tools/yaffs.py images/dream_data.img set-provisioned  # device_provisioned=1
+python3 tools/yaffs.py images/dream_data.img set-provisioned
 src/qemu/build/qemu-system-arm -M dream -bios spl.bin \
     -drive if=mtd,format=raw,file=images/dream_data.img,snapshot=on -display sdl
 ```
 
+Measured: the next boot shows the keyguard, and Menu (F1) unlocks to the
+Launcher.
+
+![RC29 home screen after set-provisioned](dream-provisioned.png)
+
 `tools/yaffs.py` reads and edits the YAFFS2 filesystems in the image
-(`--part system|cache|userdata`): `list`, `extract PATH OUT`, and
+(`--part system|cache|userdata`): `list`, `extract PATH OUT`,
 `replace PATH IN` (same size or smaller, rewriting data in place and
-keeping each chunk's spare). `set-provisioned` extracts `settings.db`,
-sets `device_provisioned` (and `install_non_market_apps`) with the `sqlite3`
-module, and writes it back. It does not recompute data-area ECC — the
-msm-nand model treats parity as zero and never checks it, so edits read
-back verbatim in the emulator but would fail a real controller.
+keeping each chunk's spare) and `rename PATH NAME`. Paths are relative to
+the partition, so settings.db is `/data/com.android.providers.settings/...`
+in `userdata`. It takes both a linear 2048+64 image and the msm-nand
+codeword image `dream_nand.py` writes (detected from the tags), and decodes
+the kernel's extra-header-info tags as well as mkyaffs2image's.
+`set-provisioned` renames the wizard, then extracts `settings.db`, sets
+(or, on RC29, inserts) `device_provisioned` and `install_non_market_apps`
+with the `sqlite3` module, and writes it back. It does not recompute
+data-area ECC — the msm-nand model treats parity as zero and never checks
+it, so edits read back verbatim in the emulator but would fail a real
+controller.
 
 ## Buttons, HBOOT and recovery keys
 
