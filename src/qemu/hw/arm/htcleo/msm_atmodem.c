@@ -245,6 +245,21 @@ static int at_crsm(MsmModemState *s, GString *out, const char *args)
     g_autofree char *line = NULL;
 
     sscanf(args, "%d,%d,%d,%d,%d", &cmd, &fileid, &p1, &p2, &p3);
+    if (cmd == 242) {
+        /*
+         * STATUS (no file id): the current directory's response, GSM
+         * 11.11 9.2.1 -- DF_GSM 7F20, 9 bytes of GSM data: characteristics,
+         * 6 DFs, 26 EFs, 4 codes, then CHV1 / UNBLOCK CHV1 / CHV2 / UNBLOCK
+         * CHV2 status (0x80 initialised | attempts left: 3, 10, 3, 10).
+         * HTC's GsmSimCard.getSimDetailStatusDone (the Dream's Hero ROMs
+         * send AT+CRSM=242 at boot) reads the retry counts from it; the
+         * "not found" answer left it no payload and com.android.phone
+         * died with a NullPointerException.
+         */
+        at_info(s, out, "+CRSM: 144,0,\"00000000"
+                "7F2002000000000009B1061A0400838A838A\"");
+        return RC_OK;
+    }
     f = sim_file(fileid);
     if (!f) {
         at_info(s, out, "+CRSM: 106,130");          /* 6A82: not found */
