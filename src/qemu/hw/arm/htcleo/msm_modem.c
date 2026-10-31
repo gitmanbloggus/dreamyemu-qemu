@@ -1044,6 +1044,14 @@ static void smem_build_v1(MsmModemState *s)
 {
     static const struct { int cid; const char *name; } chans[] = {
         { 0, "DS" }, { 1, "DIAG" }, { 2, "RPCCALL" },
+        /*
+         * rmnet0-2: raw IP, one SMD packet per datagram (cid > 4 makes
+         * them packet channels).  The cids are not the stock modem's
+         * (not measured); the kernel finds channels by name.
+         */
+        { 5, "DATA5" }, { 6, "DATA6" }, { 7, "DATA7" },
+        /* their QMI control channels, /dev/qmi0-2 (msm_qmi.c) */
+        { 8, "DATA5_CNTL" }, { 9, "DATA6_CNTL" }, { 10, "DATA7_CNTL" },
     };
     uint32_t next = SMEM_HEAP_START, tbl;
 

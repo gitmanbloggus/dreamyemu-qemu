@@ -145,6 +145,36 @@ The RPC router only started once smd-v1 channels that open straight to
 OPENED (2.6.25 skips OPENING) ran the open hooks too. Before that the
 kernel kept its built-in defaults and showed "Charging (100%)".
 
+## Mobile data
+
+```bash
+src/qemu/build/qemu-system-arm -M dream -bios spl.bin \
+    -drive if=mtd,format=raw,file=images/dream_data.img,snapshot=on \
+    -nic user,model=msm-modem,net=10.0.3.0/24 -display sdl
+```
+
+The emulated SIM is T-Mobile US (310/260), so RC29's stock APN
+(`epc.tmobile.com`) applies and Android starts a data call on its own once
+the radio registers (about 20 s after power-on). The phone gets 10.0.3.15,
+gateway 10.0.3.2 and DNS 10.0.3.3 from QEMU's user-mode network.
+
+HTC's RIL does not dial with AT on the Dream. It writes `up:<apn>` to
+`/dev/qmi0`, and the kernel's smd_qmi driver talks QMI to the modem over
+SMD `DATA5_CNTL`: a WDS client id, START_NETWORK (the modem answers with a
+handle), a broadcast packet-service indication (CONNECTED), then the
+runtime settings (address, mask, gateway, DNS). `msm_qmi.c` is the modem's
+side of that. rild then configures `rmnet0`, which on 2.6.25 is an Ethernet
+device with its own MAC: whole frames, ARP included, go over SMD `DATA5`
+and are passed to the `msm-modem` NIC unchanged. Measured: the Browser
+loads google.com, with the 3G data icon in the status bar.
+
+![The Browser on mobile data](dream-data.png)
+
+`-global msm-modem.trace=on` logs the QMI messages and every rmnet frame.
+Open: after the data call, rild answers some `SIGNAL_STRENGTH` and
+`SCREEN_STATE` requests with RADIO_NOT_AVAILABLE for a while (seen in
+logcat; data keeps working). No voice calls or SMS yet.
+
 ## Buttons, HBOOT and recovery keys
 
 `-M dream,keys=power+back` holds a combo from power-on (3 s): the SPL

@@ -527,6 +527,10 @@ void msm_modem_smd_packet(MsmModemState *s, SmdChan *c, const uint8_t *buf,
 {
     if (!strcmp(c->name, "RPCCALL")) {
         rr_handle_msg(s, buf, len);
+    } else if (strstr(c->name, "_CNTL")) {
+        msm_qmi_input(s, c, buf, len);
+    } else if (!strncmp(c->name, "DATA", 4) && c->name[4] >= '5') {
+        msm_rmnet_input(s, c, buf, len);
     }
 }
 

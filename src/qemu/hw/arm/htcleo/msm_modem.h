@@ -127,6 +127,17 @@ void msm_atmodem_reset(MsmModemState *s);
 void msm_atmodem_opened(MsmModemState *s, SmdChan *c);
 void msm_at_input(MsmModemState *s, SmdChan *c, const uint8_t *buf, int len);
 void msm_ppp_input(MsmModemState *s, SmdChan *c, const uint8_t *buf, int len);
+/* 2.6.25 rmnet: one raw IP datagram per SMD packet on DATA5-7 */
+void msm_rmnet_input(MsmModemState *s, SmdChan *c, const uint8_t *buf,
+                     int len);
+/* a QMI data call on the rmnet channel `data` (DATA5-7) up or down */
+void msm_rmnet_set_active(MsmModemState *s, const char *data, bool on);
+bool msm_rmnet_is_active(MsmModemState *s, const char *data);
+void msm_rmnet_addrs(MsmModemState *s, uint32_t *ip, uint32_t *gw,
+                     uint32_t *dns);
+
+/* msm_qmi.c: QMUX on DATA5-7_CNTL */
+void msm_qmi_input(MsmModemState *s, SmdChan *c, const uint8_t *buf, int len);
 
 /* msm_gps.c */
 void msm_gps_init(MsmModemState *s);

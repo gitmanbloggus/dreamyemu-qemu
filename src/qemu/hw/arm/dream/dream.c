@@ -34,6 +34,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "net/net.h"
 #include "qemu/units.h"
 #include "qemu/timer.h"
 #include "qemu/error-report.h"
@@ -247,6 +248,8 @@ static void dream_init(MachineState *machine)
     qdev_prop_set_bit(modem, "amss-hook", false);
     qdev_prop_set_bit(modem, "smd-v1", true);
     msm_csr_set_modem(csr, modem);
+    /* packet data (rmnet over QMI) goes to -nic ...,model=msm-modem */
+    qemu_configure_nic_device(modem, false, NULL);
     object_property_add_child(OBJECT(machine), "modem", OBJECT(modem));
     qdev_realize_and_unref(modem, NULL, &error_fatal);
     msm_modem_set_smem(MSM_MODEM(modem),

@@ -17,6 +17,10 @@
  *
  *    the phone gets 10.0.3.15 with gateway 10.0.3.2 and DNS 10.0.3.3.
  *
+ * The Dream (2.6.25) does not use PPP: its RIL brings the call up with QMI
+ * (msm_qmi.c) and rmnet0 sends whole Ethernet frames on SMD "DATA5", which
+ * go to the same NIC unchanged.
+ *
  * This code is licensed under the GNU GPL v2 or later.
  */
 #include "qemu/osdep.h"
@@ -79,6 +83,9 @@ typedef struct MsmAtModem {
     bool lcp_ours_acked, lcp_theirs_acked;
     bool ipcp_ours_acked, ipcp_theirs_acked;
     uint32_t phone_ip, gw_ip, dns_ip;
+
+    /* 2.6.25 rmnet: the DATA5-7 channel the kernel has open, or "" */
+    char rmnet[21];
 } MsmAtModem;
 
 /* ------------------------------------------------------------------------ */
@@ -558,6 +565,12 @@ static void ppp_link_reset(MsmAtModem *a)
     a->rx_esc = false;
 }
 
+/* a data call is up and the kernel's rmnet interface has its channel open */
+static bool rmnet_up(MsmAtModem *a)
+{
+    return a->rmnet[0] && a->pdp_active;
+}
+
 static bool ipcp_up(MsmAtModem *a)
 {
     return a->ipcp_ours_acked && a->ipcp_theirs_acked;
@@ -772,6 +785,53 @@ void msm_ppp_input(MsmModemState *s, SmdChan *c, const uint8_t *buf, int len)
     }
 }
 
+void msm_rmnet_set_active(MsmModemState *s, const char *data, bool on)
+{
+    MsmAtModem *a = s->at;
+
+    if (on) {
+        pstrcpy(a->rmnet, sizeof(a->rmnet), data);
+        ATLOG("data call on %s\n", data);
+    } else if (strcmp(a->rmnet, data)) {
+        return;
+    }
+    a->pdp_active = on;
+}
+
+bool msm_rmnet_is_active(MsmModemState *s, const char *data)
+{
+    return rmnet_up(s->at) && !strcmp(s->at->rmnet, data);
+}
+
+void msm_rmnet_addrs(MsmModemState *s, uint32_t *ip, uint32_t *gw,
+                     uint32_t *dns)
+{
+    *ip = s->at->phone_ip;
+    *gw = s->at->gw_ip;
+    *dns = s->at->dns_ip;
+}
+
+void msm_rmnet_input(MsmModemState *s, SmdChan *c, const uint8_t *buf,
+                     int len)
+{
+    MsmAtModem *a = s->at;
+
+    if (s->trace) {
+        g_autoptr(GString) hex = qemu_hexdump_line(NULL, buf, MIN(len, 48),
+                                                   1, 0);
+        qemu_log("modem rmnet: %s tx %d bytes: %s\n", c->name, len,
+                 hex->str);
+    }
+    /*
+     * 2.6.25 rmnet is an Ethernet device with a MAC of its own: it sends
+     * whole frames, ARP included (measured: a 42-byte who-has for the
+     * DNS address), so they go to the network as they are.
+     */
+    if (rmnet_up(a) && len >= 14) {
+        qemu_send_packet(qemu_get_queue(s->nic), buf, MIN(len, 14 + PPP_MAX));
+    }
+}
+
 /* ------------------------------------------------------------------------ */
 /* The network side                                                          */
 /* ------------------------------------------------------------------------ */
@@ -807,6 +867,9 @@ static bool modem_can_receive(NetClientState *nc)
     MsmModemState *s = qemu_get_nic_opaque(nc);
     SmdChan c;
 
+    if (rmnet_up(s->at)) {
+        return true;    /* full FIFO: the datagram is dropped, as IP may */
+    }
     if (!ipcp_up(s->at)) {
         return false;
     }
@@ -826,7 +889,22 @@ static ssize_t modem_receive(NetClientState *nc, const uint8_t *buf,
         return len;
     }
     type = lduw_be_p(buf + 12);
-    if (type == ETH_P_ARP && len >= 42 && lduw_be_p(buf + 20) == 1 &&
+    if (rmnet_up(a)) {
+        /* the frame as it is: rmnet answers its own ARP */
+        SmdChan c;
+        int ok = -2;
+
+        if (msm_modem_find_channel(s, a->rmnet, 0, &c)) {
+            ok = smd_modem_send_packet(s, &c, buf, MIN(len, 14 + PPP_MAX));
+            if (ok >= 0) {
+                smd_kick_apps(s, &c);
+            }
+        }
+        if (s->trace) {
+            qemu_log("modem rmnet: %s rx %zu bytes type %04x -> %d\n",
+                     a->rmnet, len, type, ok);
+        }
+    } else if (type == ETH_P_ARP && len >= 42 && lduw_be_p(buf + 20) == 1 &&
         ldl_be_p(buf + 38) == a->phone_ip) {
         arp_send(s, 2, buf + 22, ldl_be_p(buf + 28));
     } else if (type == ETH_P_IP && ipcp_up(a)) {
@@ -986,6 +1064,7 @@ void msm_atmodem_reset(MsmModemState *s)
     a->cfun = 0;
     a->pdp_active = a->online = false;
     a->sim_announced = false;
+    a->rmnet[0] = 0;
     pstrcpy(a->apn, sizeof(a->apn), "internet");
     ppp_link_reset(a);
     timer_del(a->reg_timer);
