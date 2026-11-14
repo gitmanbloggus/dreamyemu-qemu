@@ -82,6 +82,37 @@ static const struct {
     { 0x3000005b, 0x00010001, "pdapi (gps)" },
 };
 
+/*
+ * The Dream's kernels are built for AMSS 6225 (CONFIG_MSM_AMSS_VERSION),
+ * whose hashed program versions msm_rpc_connect matches exactly: with only
+ * the entries above the adsp driver ("rs3000000a:71d1094b") never probed
+ * and audmgr/snd could not connect.  smd-v1 only.
+ */
+static const struct {
+    uint32_t prog, vers;
+    const char *what;
+} dream_programs[] = {
+    { 0x3000000a, 0x71d1094b, "adsp rtos (6225)" },
+    { 0x30000013, 0xe94e8f0c, "audmgr (6225)" },
+    { 0x30000002, 0xaa2b1a44, "snd (6225)" },
+};
+
+/* adsp.h / audmgr.h, AMSS 6225 */
+#define ADSP_RTOS_MTOA_PROG     0x3000000b
+#define ADSP_RTOS_MTOA_VERS     0xee3a9966
+#define ADSP_RTOS_CMD_ENABLE    1
+#define ADSP_RTOS_CMD_DISABLE   2
+#define ADSP_RTOS_MOD_READY     0
+#define ADSP_RTOS_MOD_DISABLE   1
+#define ADSP_RTOS_PROC_APPS     2
+#define AUDMGR_CB_PROG          0x31000013
+#define AUDMGR_CB_VERS          0x21570ba7
+#define AUDMGR_ENABLE_CLIENT    2
+#define AUDMGR_DISABLE_CLIENT   3
+#define AUDMGR_STATUS_READY         0
+#define AUDMGR_STATUS_CODEC_CONFIG  1
+#define AUDMGR_STATUS_DISABLED      6
+
 typedef struct RpcMsg {
     uint32_t xid, prog, vers, proc;
     const uint8_t *args;
@@ -257,8 +288,84 @@ static void prog_htc_battery_v1(MsmModemState *s, const RpcMsg *m,
     }
 }
 
+/*
+ * adsp_rtos APP_TO_MODEM (proc 2: gotit, cmd, proc_id, module).  AMSS
+ * answers the call, then reports the task's new state with a
+ * MODEM_TO_APP call (0x3000000b proc 2: gotit, event, proc_id, module,
+ * image); msm_adsp_enable() waits up to a second for MOD_READY.  Image 0
+ * ("combo") holds every task the Dream's kernel lists.
+ */
+static void prog_adsp_rtos(MsmModemState *s, const RpcMsg *m, RpcReply *r)
+{
+    uint32_t cmd = arg_be32(m, 1), module = arg_be32(m, 3);
+    uint32_t ev[5];
+
+    if (m->proc == 2 && (cmd == ADSP_RTOS_CMD_ENABLE ||
+                         cmd == ADSP_RTOS_CMD_DISABLE)) {
+        bool en = cmd == ADSP_RTOS_CMD_ENABLE;
+
+        if (s->adsp_module) {
+            s->adsp_module(s->adsp_opaque, module, en);
+        }
+        ev[0] = cpu_to_be32(1);
+        ev[1] = cpu_to_be32(en ? ADSP_RTOS_MOD_READY : ADSP_RTOS_MOD_DISABLE);
+        ev[2] = cpu_to_be32(ADSP_RTOS_PROC_APPS);
+        ev[3] = cpu_to_be32(module);
+        ev[4] = cpu_to_be32(0);
+        msm_rpc_apps_call_later(s, 2 * SCALE_MS, ADSP_RTOS_MTOA_PROG,
+                                ADSP_RTOS_MTOA_VERS, 2, ev, 5);
+    }
+    /* accepted, void result */
+}
+
+/*
+ * audmgr: ENABLE_CLIENT is answered by callbacks to the caller's endpoint
+ * (0x31000013 proc 1: cb_id, set_to_one, status, handle/volume), READY
+ * then CODEC_CONFIG; audmgr_enable() BUG()s after 15 s without them.
+ * DISABLE_CLIENT gets DISABLED.
+ */
+static void prog_audmgr(MsmModemState *s, const RpcMsg *m, RpcReply *r)
+{
+    uint32_t cb[4] = { cpu_to_be32(0x11111111), cpu_to_be32(1) };
+
+    switch (m->proc) {
+    case AUDMGR_ENABLE_CLIENT:
+        cb[2] = cpu_to_be32(AUDMGR_STATUS_READY);
+        cb[3] = cpu_to_be32(1);                 /* handle */
+        msm_rpc_apps_call_later(s, 1 * SCALE_MS, AUDMGR_CB_PROG,
+                                AUDMGR_CB_VERS, 1, cb, 4);
+        cb[2] = cpu_to_be32(AUDMGR_STATUS_CODEC_CONFIG);
+        cb[3] = cpu_to_be32(0);                 /* volume */
+        msm_rpc_apps_call_later(s, 2 * SCALE_MS, AUDMGR_CB_PROG,
+                                AUDMGR_CB_VERS, 1, cb, 4);
+        put_be32(r, 0);
+        break;
+    case AUDMGR_DISABLE_CLIENT:
+        cb[2] = cpu_to_be32(AUDMGR_STATUS_DISABLED);
+        cb[3] = cpu_to_be32(1);
+        msm_rpc_apps_call_later(s, 1 * SCALE_MS, AUDMGR_CB_PROG,
+                                AUDMGR_CB_VERS, 1, cb, 4);
+        put_be32(r, 0);
+        break;
+    default:
+        prog_default(s, m, r);
+        break;
+    }
+}
+
 static void rpc_dispatch(MsmModemState *s, const RpcMsg *m, RpcReply *r)
 {
+    if (s->smd_v1) {
+        switch (m->prog) {
+        case 0x3000000a:
+            prog_adsp_rtos(s, m, r);
+            return;
+        case 0x30000013:
+            prog_audmgr(s, m, r);
+            return;
+        }
+    }
+
     switch (m->prog) {
     case 0x30000048:
         prog_time_remote(s, m, r);
@@ -570,7 +677,9 @@ void msm_rpc_apps_call(MsmModemState *s, uint32_t prog, uint32_t vers,
      */
     for (guint i = 0; i < s->rpc_servers->len; i++) {
         RpcServer *o = &g_array_index(s->rpc_servers, RpcServer, i);
-        if (o->prog == (prog & ~RPC_CB_BIT)) {
+        /* adsp_rtos's MODEM_TO_APP calls come from its server's cid */
+        if (o->prog == (prog & ~RPC_CB_BIT) ||
+            (prog == ADSP_RTOS_MTOA_PROG && o->prog == 0x3000000a)) {
             src_cid = o->cid;
             break;
         }
@@ -596,6 +705,40 @@ void msm_rpc_apps_call(MsmModemState *s, uint32_t prog, uint32_t vers,
     }
 }
 
+typedef struct RpcLaterCall {
+    MsmModemState *s;
+    QEMUTimer *timer;
+    uint32_t prog, vers, proc;
+    int nargs;
+    uint32_t args[];
+} RpcLaterCall;
+
+static void rpc_later_fire(void *opaque)
+{
+    RpcLaterCall *c = opaque;
+
+    msm_rpc_apps_call(c->s, c->prog, c->vers, c->proc, c->args, c->nargs);
+    timer_free(c->timer);
+    g_free(c);
+}
+
+/* msm_rpc_apps_call() once the reply to the current call has gone out */
+void msm_rpc_apps_call_later(MsmModemState *s, int64_t delay_ns,
+                             uint32_t prog, uint32_t vers, uint32_t proc,
+                             const uint32_t *args, int nargs)
+{
+    RpcLaterCall *c = g_malloc0(sizeof(*c) + 4 * nargs);
+
+    c->s = s;
+    c->prog = prog;
+    c->vers = vers;
+    c->proc = proc;
+    c->nargs = nargs;
+    memcpy(c->args, args, 4 * nargs);
+    c->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rpc_later_fire, c);
+    timer_mod(c->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns);
+}
+
 void msm_modem_rpc_reset(MsmModemState *s)
 {
     g_array_set_size(s->rpc_apps_servers, 0);
@@ -619,6 +762,14 @@ void msm_modem_rpc_init(MsmModemState *s)
             .prog = modem_programs[i].prog,
             .vers = modem_programs[i].vers,
             .cid = 0x100 + i,
+        };
+        g_array_append_val(s->rpc_servers, sv);
+    }
+    for (size_t i = 0; s->smd_v1 && i < ARRAY_SIZE(dream_programs); i++) {
+        RpcServer sv = {
+            .prog = dream_programs[i].prog,
+            .vers = dream_programs[i].vers,
+            .cid = 0x100 + ARRAY_SIZE(modem_programs) + i,
         };
         g_array_append_val(s->rpc_servers, sv);
     }

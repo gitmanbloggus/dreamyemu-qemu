@@ -14,7 +14,8 @@ The web UI (`web/`, `npm run dev`) runs it too: Config -> Phone -> Machine
 (2048 x 64 x 2112 bytes), SD cards by a `sdcard*` or `*_sd*` name. Boot:
 normal, Recovery (`keys=home+power`) or HBOOT (`keys=power+back`). Typing
 goes to the QWERTY keypad as qcodes, the arrows roll the trackball, F10
-presses it. No audio, adb or WiFi on this machine yet.
+presses it. No adb or WiFi on this machine yet; audio is the aDSP's host
+PCM path (below).
 The keyboard button (or F11) slides the keyboard out through the machine's
 `keyboard-open` property (qom-get/qom-set on /machine): the drawn phone
 turns on its side, the screen slab slides up, and the chin stays with the
@@ -312,3 +313,25 @@ codeword 3's parity (where the SPL probes data+2064), and the factory
 marker at codeword 3 offset 464 with the displaced user byte at 526. The
 SPL reads it correctly (measured above). The kernel's CFG1 marker position
 is still unverified.
+
+## aDSP (qdsp5): audio and the video task
+
+`msm-adsp5` (`hw/arm/dream/msm_adsp5.c`) is the application DSP at
+0xAC000000 (IRQ 23). AMSS enables its tasks over RPC: `msm_rpc.c` now
+announces adsp_rtos, audmgr and snd at the AMSS 6225 versions the Dream's
+kernels connect to (`smd-v1` only), answers a task enable with a MOD_READY
+callback (0x3000000b), and answers audmgr's ENABLE_CLIENT with READY and
+CODEC_CONFIG callbacks (without them `audmgr_enable` BUG()s after 15 s).
+
+- AUDPPTASK: CFG enable/sleep and the host PCM interface behind
+  `/dev/msm_pcm_out` (AudioFlinger's output). Each ARM -> DSP buffer is
+  played on QEMU's audio backend (`-audio pa` / `-audiodev ...`) and asked
+  for again once its time has passed.
+- VIDEOTASK: the H.264 command/event sequence captured from stock Android
+  (htcdreamfulldriverdecomp `dsp/PLAN.md`): init -> msg 0, each subframe
+  packet -> msgs 2 and 4, the `b203` end packet -> msg 0. No pixels are
+  decoded yet.
+- Not modelled: AUDPLAY decoders (`/dev/msm_mp3`), recording, VFE/JPEG.
+
+`-global msm-adsp5.trace=on` logs every command and event; `-d unimp` shows
+the commands the model ignores.

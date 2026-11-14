@@ -114,6 +114,7 @@ arm_common_ss.add(when: 'CONFIG_HTCLEO', if_true: files(
   'htcleo/htcleo.c',
   'dream/dream.c',
   'dream/msm_mddi.c',
+  'dream/msm_adsp5.c',
   'dream/dream_input.c',
   'dream/dream_synaptics.c',
   'htcleo/msm_vic.c',

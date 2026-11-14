@@ -55,6 +55,7 @@
 #include "../htcleo/htcleo.h"
 #include "../htcleo/msm_regfile.h"
 #include "msm_mddi.h"
+#include "msm_adsp5.h"
 #include "../htcleo/msm_mdp.h"
 #include "dream_input.h"
 #include "dream_synaptics.h"
@@ -81,6 +82,7 @@
 #define DREAM_PMDH_PHYS         0xAA600000
 #define DREAM_VIC_PHYS          0xC0000000
 #define DREAM_CSR_PHYS          0xC0100000
+#define DREAM_AD5_PHYS          0xAC000000      /* aDSP (qdsp5) */
 #define DREAM_SMEM_PHYS         0x01F00000      /* inside SMI */
 
 /* MSM7x01A VIC lines (arch/arm/mach-msm/include/mach/irqs.h) */
@@ -94,6 +96,7 @@
 #define DREAM_INT_MDP               19
 #define DREAM_INT_ADM_AARM          21
 #define DREAM_INT_ADSP_A11          22
+#define DREAM_INT_ADSP_A9_A11       23      /* the qdsp5 driver's IRQ */
 #define DREAM_INT_GPIO_GROUP1       32
 #define DREAM_INT_GPIO_GROUP2       33
 #define DREAM_INT_PWB_I2C           34
@@ -273,6 +276,16 @@ static void dream_init(MachineState *machine)
     qdev_connect_gpio_out_named(modem, "m2a", M2A_DSP,
                                 qdev_get_gpio_in(vic, DREAM_INT_ADSP_A11));
     qemu_register_reset(dream_modem_reset, modem);
+
+    /* aDSP: task enables come over the modem's adsp_rtos RPC server */
+    dev = qdev_new(TYPE_MSM_ADSP5);
+    object_property_add_child(OBJECT(machine), "adsp", OBJECT(dev));
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, DREAM_AD5_PHYS);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_ADSP_A9_A11));
+    MSM_MODEM(modem)->adsp_module = msm_adsp5_module_enable;
+    MSM_MODEM(modem)->adsp_opaque = dev;
 
     dev = qdev_new(TYPE_MSM_GPIO);
     qdev_prop_set_bit(dev, "msm7x01a", true);
