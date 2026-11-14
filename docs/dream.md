@@ -329,8 +329,14 @@ CODEC_CONFIG callbacks (without them `audmgr_enable` BUG()s after 15 s).
   for again once its time has passed.
 - VIDEOTASK: the H.264 command/event sequence captured from stock Android
   (htcdreamfulldriverdecomp `dsp/PLAN.md`): init -> msg 0, each subframe
-  packet -> msgs 2 and 4, the `b203` end packet -> msg 0. No pixels are
-  decoded yet.
+  packet -> msgs 2 and 4, the `b203` end packet -> msg 0. Each packet is
+  rebuilt into a plain H.264 stream (`dream_h264_rw.c`: the packet says how
+  many slice-header bits to skip, so a fresh header against a fixed SPS/PPS
+  replaces it) and decoded with libavcodec into the packet's output buffer
+  as NV21. Without libavcodec at build time the frames stay blank. The PPS
+  chroma QP offset is not in the packets: `msm-adsp5.vdec-chroma-qp-offset`
+  (default -2, x264's). Driven over qtest with the BBB clip's packets the
+  output is bit-exact with ffmpeg (240/240 frames).
 - Not modelled: AUDPLAY decoders (`/dev/msm_mp3`), recording, VFE/JPEG.
 
 `-global msm-adsp5.trace=on` logs every command and event; `-d unimp` shows

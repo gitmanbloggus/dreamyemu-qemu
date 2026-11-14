@@ -32,13 +32,16 @@
  *   VIDEOTASK (task 4): the H.264 command/event sequence captured from
  *       stock Android (htcdreamfulldriverdecomp dsp/PLAN.md): the init
  *       command gets msg 0 {1, 0}; each subframe packet gets msgs 2 and 4
- *       {seq, codec instance}; the b203 end packet gets msg 0.  No pixels
- *       are decoded yet: the output frame buffers keep what was in them.
+ *       {seq, codec instance}; the b203 end packet gets msg 0.  Each
+ *       packet is rebuilt into a plain H.264 stream (dream_h264_rw.c) and,
+ *       when QEMU is built with libavcodec, decoded into the packet's
+ *       output buffer as NV21, as the DSP does.
  * Other tasks accept their commands and say nothing (-d unimp logs them).
  */
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "qemu/audio.h"
 #include "hw/core/irq.h"
@@ -46,7 +49,13 @@
 #include "hw/core/qdev-properties-system.h"
 #include "hw/core/sysbus.h"
 #include "system/physmem.h"
+#include "qemu/units.h"
 #include "msm_adsp5.h"
+#include "dream_h264_rw.h"
+#ifdef DREAM_AVCODEC
+#include <libavcodec/avcodec.h>
+#include <libavutil/frame.h>
+#endif
 
 OBJECT_DECLARE_SIMPLE_TYPE(MsmAdsp5State, MSM_ADSP5)
 
@@ -121,6 +130,17 @@ struct MsmAdsp5State {
     QEMUTimer *pcm_timer;
     AudioBackend *audio_be;
     SWVoiceOut *voice;
+
+    /* VIDEOTASK */
+    H264Rw rw;
+    uint8_t *annexb;
+    int32_t chroma_qp_offset;
+    uint64_t vdec_frames;
+#ifdef DREAM_AVCODEC
+    AVCodecContext *avc;
+    AVFrame *frm;
+    AVPacket *avpkt;
+#endif
 
     bool trace;
 };
@@ -324,21 +344,136 @@ static void adsp5_audpp_cmd(MsmAdsp5State *s, uint32_t q, const uint16_t *c)
 /* VIDEOTASK                                                         */
 /* ---------------------------------------------------------------- */
 
+#define VDEC_PKT_MAX        (2 * MiB)       /* bytes of one subframe packet */
+
+#ifdef DREAM_AVCODEC
+static void adsp5_vdec_close(MsmAdsp5State *s)
+{
+    avcodec_free_context(&s->avc);
+    av_frame_free(&s->frm);
+    av_packet_free(&s->avpkt);
+}
+
+static void adsp5_vdec_open(MsmAdsp5State *s)
+{
+    const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+
+    adsp5_vdec_close(s);
+    if (!codec) {
+        return;
+    }
+    s->avc = avcodec_alloc_context3(codec);
+    s->avc->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    s->avc->thread_count = 1;
+    if (avcodec_open2(s->avc, codec, NULL) < 0) {
+        avcodec_free_context(&s->avc);
+        return;
+    }
+    s->frm = av_frame_alloc();
+    s->avpkt = av_packet_alloc();
+}
+
+/* the decoded picture into the packet's output buffer, as NV21 */
+static void adsp5_vdec_store(MsmAdsp5State *s, const H264RwPic *pic)
+{
+    AVFrame *f = s->frm;
+    int w = MIN(pic->width, f->width), h = MIN(pic->height, f->height);
+    uint32_t lw = pic->line_width, y0 = pic->out_addr;
+    uint32_t c0 = y0 + lw * pic->height;
+    g_autofree uint8_t *row = g_malloc(lw);
+
+    if (f->format != AV_PIX_FMT_YUV420P && f->format != AV_PIX_FMT_YUVJ420P) {
+        return;
+    }
+    for (int y = 0; y < h; y++) {
+        physical_memory_write(y0 + y * lw, f->data[0] + y * f->linesize[0], w);
+    }
+    for (int y = 0; y < h / 2; y++) {
+        const uint8_t *u = f->data[1] + y * f->linesize[1];
+        const uint8_t *v = f->data[2] + y * f->linesize[2];
+
+        for (int x = 0; x < w / 2; x++) {
+            row[2 * x] = v[x];
+            row[2 * x + 1] = u[x];
+        }
+        physical_memory_write(c0 + y * lw, row, w);
+    }
+}
+
+static void adsp5_vdec_decode(MsmAdsp5State *s, const uint8_t *nal, int n,
+                              const H264RwPic *pic)
+{
+    if (!s->avc && (adsp5_vdec_open(s), !s->avc)) {
+        return;
+    }
+    s->avpkt->data = (uint8_t *)nal;
+    s->avpkt->size = n;
+    if (avcodec_send_packet(s->avc, s->avpkt) < 0) {
+        return;
+    }
+    while (avcodec_receive_frame(s->avc, s->frm) == 0) {
+        adsp5_vdec_store(s, pic);
+        s->vdec_frames++;
+    }
+}
+#endif
+
+/*
+ * One subframe packet: rebuilt into H.264 (dream_h264_rw.c), decoded, and
+ * the picture stored in the packet's output buffer before the DSP says
+ * it is done, as the real DSP has by then.
+ */
+static bool adsp5_vdec_packet(MsmAdsp5State *s, uint32_t addr, uint32_t words)
+{
+    g_autofree uint16_t *w = NULL;
+    H264RwPic pic;
+    int n;
+
+    words = MIN(words, VDEC_PKT_MAX / 2);
+    w = g_new(uint16_t, MAX(words, 1));
+    physical_memory_read(addr, w, words * 2);
+    for (uint32_t i = 0; i < words; i++) {
+        w[i] = le16_to_cpu(w[i]);
+    }
+    n = h264rw_packet(&s->rw, w, words, s->annexb, VDEC_PKT_MAX + 4096,
+                      &pic);
+    if (pic.end) {
+        return true;
+    }
+    if (n < 0) {
+        qemu_log_mask(LOG_UNIMP, "adsp5: VIDEOTASK packet at %08x (%u words)"
+                      " not understood\n", addr, words);
+        return false;
+    }
+#ifdef DREAM_AVCODEC
+    adsp5_vdec_decode(s, s->annexb, n, &pic);
+#endif
+    if (s->trace) {
+        qemu_log("adsp5: vdec %dx%d -> %08x (%d bytes of H.264)\n",
+                 pic.width, pic.height, pic.out_addr, n);
+    }
+    return false;
+}
+
 static void adsp5_vdec_cmd(MsmAdsp5State *s, uint32_t q, const uint16_t *c)
 {
     if (q == Q_VDEC_CMD) {
         static const uint16_t init[2] = { 1, 0 };
 
+        /* a new decoding session */
+        s->rw = (H264Rw){ .chroma_qp_offset = s->chroma_qp_offset };
+#ifdef DREAM_AVCODEC
+        adsp5_vdec_close(s);
+#endif
         adsp5_event(s, TASK_VIDEO, 0, init, 2);
         return;
     }
     if (c[0] == 0x0000) {               /* VIDDEC_CMD_SUBFRAME_PKT */
+        uint32_t words = (uint32_t)c[3] << 16 | c[4];
         uint32_t pkt = (uint32_t)c[5] << 16 | c[6];
         uint16_t m[2] = { c[1], c[2] }; /* seq, codec instance */
-        uint8_t hdr[2];
 
-        physical_memory_read(pkt, hdr, 2);
-        if (lduw_le_p(hdr) == 0xb203) { /* end of stream */
+        if (adsp5_vdec_packet(s, pkt, words)) {     /* end of stream */
             m[0] = 0;
             adsp5_event(s, TASK_VIDEO, 0, m, 2);
         } else {
@@ -501,6 +636,11 @@ static void adsp5_realize(DeviceState *dev, Error **errp)
     s->pcm_playing = -1;
     s->evt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, adsp5_evt_timer, s);
     s->pcm_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, adsp5_pcm_timer, s);
+    s->annexb = g_malloc(VDEC_PKT_MAX + 4096);
+#ifndef DREAM_AVCODEC
+    warn_report_once("msm-adsp5: built without libavcodec; "
+                     "VIDEOTASK frames stay blank");
+#endif
 }
 
 static void adsp5_init(Object *obj)
@@ -516,6 +656,9 @@ static void adsp5_init(Object *obj)
 static const Property adsp5_props[] = {
     DEFINE_AUDIO_PROPERTIES(MsmAdsp5State, audio_be),
     DEFINE_PROP_BOOL("trace", MsmAdsp5State, trace, false),
+    /* the stream's PPS chroma_qp_index_offset: not in the packets */
+    DEFINE_PROP_INT32("vdec-chroma-qp-offset", MsmAdsp5State,
+                      chroma_qp_offset, -2),
 };
 
 static void adsp5_class_init(ObjectClass *oc, const void *data)
