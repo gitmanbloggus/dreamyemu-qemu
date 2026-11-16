@@ -110,10 +110,23 @@ arm_common_ss.add(when: 'CONFIG_SX1', if_true: files('omap_sx1.c'))
 arm_common_ss.add(when: 'CONFIG_VERSATILE', if_true: files('versatilepb.c'))
 arm_common_ss.add(when: 'CONFIG_VEXPRESS', if_true: files('vexpress.c'))
 
+# The Dream's VIDEOTASK decodes H.264 with libavcodec when it is there
+dream_avcodec = dependency('libavcodec', required: false)
+dream_avutil = dependency('libavutil', required: false)
+if dream_avcodec.found() and dream_avutil.found()
+  arm_common_ss.add(when: 'CONFIG_HTCLEO', if_true: [
+    dream_avcodec, dream_avutil,
+    declare_dependency(compile_args: '-DDREAM_AVCODEC'),
+  ])
+endif
+
 arm_common_ss.add(when: 'CONFIG_HTCLEO', if_true: files(
   'htcleo/htcleo.c',
   'dream/dream.c',
   'dream/msm_mddi.c',
+  'dream/msm_adsp5.c',
+  'dream/dream_h264_rw.c',
+  'dream/msm_adreno130.c',
   'dream/dream_input.c',
   'dream/dream_synaptics.c',
   'htcleo/msm_vic.c',

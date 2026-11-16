@@ -90,6 +90,10 @@ struct MsmModemState {
     NICConf nic_conf;
     NICState *nic;
 
+    /* Dream aDSP (hw/arm/dream/msm_adsp5.c): adsp_rtos task enables */
+    void (*adsp_module)(void *opaque, uint32_t module, bool enable);
+    void *adsp_opaque;
+
     /* GPS (msm_gps.c) */
     struct MsmGps *gps;
     char *gps_lat, *gps_lon, *gps_alt;
@@ -156,6 +160,9 @@ void msm_gps_reset(MsmModemState *s);
 /* PDAPI (0x3000005b) calls; returns the result word */
 uint32_t msm_gps_pdapi_call(MsmModemState *s, uint32_t proc,
                             const uint8_t *args, uint32_t len);
+void msm_rpc_apps_call_later(MsmModemState *s, int64_t delay_ns,
+                             uint32_t prog, uint32_t vers, uint32_t proc,
+                             const uint32_t *args, int nargs);
 void msm_rpc_apps_call(MsmModemState *s, uint32_t prog, uint32_t vers,
                        uint32_t proc, const uint32_t *args, int nargs);
 bool msm_modem_find_channel(MsmModemState *s, const char *name, int type,

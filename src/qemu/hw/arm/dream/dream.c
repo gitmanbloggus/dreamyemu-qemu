@@ -56,6 +56,8 @@
 #include "../htcleo/htcleo.h"
 #include "../htcleo/msm_regfile.h"
 #include "msm_mddi.h"
+#include "msm_adsp5.h"
+#include "msm_adreno130.h"
 #include "../htcleo/msm_mdp.h"
 #include "dream_input.h"
 #include "dream_synaptics.h"
@@ -84,6 +86,8 @@
 #define DREAM_PMDH_PHYS         0xAA600000
 #define DREAM_VIC_PHYS          0xC0000000
 #define DREAM_CSR_PHYS          0xC0100000
+#define DREAM_GPU_PHYS          0xA0000000      /* Adreno 130, 1 MiB */
+#define DREAM_AD5_PHYS          0xAC000000      /* aDSP (qdsp5) */
 #define DREAM_SMEM_PHYS         0x01F00000      /* inside SMI */
 
 /* MSM7x01A VIC lines (arch/arm/mach-msm/include/mach/irqs.h) */
@@ -97,6 +101,7 @@
 #define DREAM_INT_MDP               19
 #define DREAM_INT_ADM_AARM          21
 #define DREAM_INT_ADSP_A11          22
+#define DREAM_INT_ADSP_A9_A11       23      /* the qdsp5 driver's IRQ */
 #define DREAM_AD5_PHYS              0xAC000000
 /* the qdsp5 driver's request_irq(0x17) (msm_adsp_probe) */
 #define DREAM_INT_ADSP_A9_A11       23
@@ -107,8 +112,18 @@
 #define DREAM_INT_GPIO_GROUP1       32
 #define DREAM_INT_GPIO_GROUP2       33
 #define DREAM_INT_PWB_I2C           34
+#define DREAM_INT_GRAPHICS          20      /* hw3d */
 #define DREAM_INT_NAND_WR_ER_DONE   36
 #define DREAM_INT_NAND_OP_DONE      37
+#define DREAM_INT_SDC1_0            24      /* irqs-7x00.h */
+#define DREAM_INT_SDC1_1            25
+#define DREAM_INT_SDC2_0            26
+#define DREAM_INT_SDC2_1            27
+
+#define DREAM_HSUSB_PHYS        0xA0800000
+#define DREAM_INT_USB_HS            47
+#define DREAM_SDC1_PHYS         0xA0400000      /* WiFi (SDIO), no card */
+#define DREAM_SDC2_PHYS         0xA0500000      /* the microSD slot */
 
 #define DREAM_GPIO_LCD_VSYNC    97
 
@@ -146,6 +161,7 @@ static void dream_modem_reset(void *opaque)
 }
 
 static char *dream_boot_keys;
+static bool dream_gpu;          /* -M dream,gpu=on: model the Adreno 130 */
 
 static void dream_dma2_to_panel(void *opaque, uint32_t base, uint32_t stride,
                                 int w, int h, int x, int y)
@@ -181,6 +197,7 @@ static void dream_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *smi = g_new(MemoryRegion, 1);
+    DeviceState *vic, *csr, *modem, *mdp, *mddi, *adm, *dev;
     DeviceState *vic, *csr, *modem, *mdp, *mddi, *dev, *adm;
     MsmGpioState *gpio;
     I2CBus *i2c;
@@ -282,6 +299,30 @@ static void dream_init(MachineState *machine)
                    qdev_get_gpio_in(vic, DREAM_INT_ADSP_A9_A11));
     qemu_register_reset(dream_modem_reset, modem);
 
+    /*
+     * Adreno 130: opt-in.  Unmapped, libhgl fails its chip check and
+     * Android draws in software; the model only draws what the phone
+     * captures cover so far (msm_adreno130.c).
+     */
+    if (dream_gpu) {
+        dev = qdev_new(TYPE_MSM_ADRENO130);
+        object_property_add_child(OBJECT(machine), "adreno130", OBJECT(dev));
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, DREAM_GPU_PHYS);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_GRAPHICS));
+    }
+
+    /* aDSP: task enables come over the modem's adsp_rtos RPC server */
+    dev = qdev_new(TYPE_MSM_ADSP5);
+    object_property_add_child(OBJECT(machine), "adsp", OBJECT(dev));
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, DREAM_AD5_PHYS);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_ADSP_A9_A11));
+    MSM_MODEM(modem)->adsp_module = msm_adsp5_module_enable;
+    MSM_MODEM(modem)->adsp_opaque = dev;
+
     dev = qdev_new(TYPE_MSM_GPIO);
     qdev_prop_set_bit(dev, "msm7x01a", true);
     qdev_prop_set_int32(dev, "ps-hold", 25);
@@ -325,6 +366,48 @@ static void dream_init(MachineState *machine)
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, DREAM_DMOV_PHYS);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_ADM_AARM));
+
+    /*
+     * SD controllers, the HD2's msm-sdcc: SDC1 is the WiFi SDIO slot (no
+     * card), SDC2 the microSD slot with -drive if=sd.  The slot's switch
+     * is the CPLD's TROUT_GPIO_SDMC_CD_N, read at +0x0A as 0 = card in,
+     * so the kernel always sees a card; with no drive it times out.
+     */
+    for (int i = 0; i < 2; i++) {
+        static const hwaddr base[2] = { DREAM_SDC1_PHYS, DREAM_SDC2_PHYS };
+        static const int irq[2][2] = {
+            { DREAM_INT_SDC1_0, DREAM_INT_SDC1_1 },
+            { DREAM_INT_SDC2_0, DREAM_INT_SDC2_1 },
+        };
+
+        dev = qdev_new(TYPE_MSM_SDCC);
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, base[i]);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, irq[i][0]));
+        sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(vic, irq[i][1]));
+        msm_sdcc_connect_adm(dev, adm, base[i]);
+        dinfo = i == 1 ? drive_get(IF_SD, 0, 0) : NULL;
+        if (dinfo) {
+            DeviceState *card = qdev_new(TYPE_SD_CARD);
+
+            qdev_prop_set_drive_err(card, "drive", blk_by_legacy_dinfo(dinfo),
+                                    &error_fatal);
+            qdev_realize_and_unref(card, qdev_get_child_bus(dev, "sd-bus"),
+                                   &error_fatal);
+        }
+    }
+
+    /*
+     * High-speed USB (ChipIdea "msm72k", device mode): the HD2's model
+     * with its built-in host, which enumerates the gadget and pipes an
+     * adb interface to -global msm-hsusb.adb=<chardev>.
+     */
+    dev = qdev_new(TYPE_MSM_HSUSB);
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, DREAM_HSUSB_PHYS);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_USB_HS));
 
     dev = qdev_new(TYPE_MSM_NAND);
     qdev_prop_set_uint32(dev, "flash-id", DREAM_NAND_ID);
@@ -426,6 +509,26 @@ static void dream_init(MachineState *machine)
     }
 }
 
+static bool dream_get_gpu(Object *obj, Error **errp)
+{
+    return dream_gpu;
+}
+
+static void dream_set_gpu(Object *obj, bool on, Error **errp)
+{
+    dream_gpu = on;
+}
+
+static bool dream_get_kbd(Object *obj, Error **errp)
+{
+    return dream_input_keyboard_open();
+}
+
+static void dream_set_kbd(Object *obj, bool open, Error **errp)
+{
+    dream_input_set_keyboard_open(open);
+}
+
 static void dream_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -442,6 +545,14 @@ static void dream_machine_class_init(ObjectClass *oc, const void *data)
     mc->no_floppy = true;
     mc->no_parallel = true;
     object_class_property_add_str(oc, "keys", dream_get_keys, dream_set_keys);
+    object_class_property_add_bool(oc, "gpu", dream_get_gpu, dream_set_gpu);
+    object_class_property_set_description(oc, "gpu",
+        "Model the Adreno 130 at 0xA0000000 (experimental; Android then "
+        "takes the GPU path)");
+    object_class_property_add_bool(oc, "keyboard-open", dream_get_kbd,
+                                   dream_set_kbd);
+    object_class_property_set_description(oc, "keyboard-open",
+        "The QWERTY keyboard slid out (SW_LID, landscape); F11 toggles it");
     object_class_property_set_description(oc, "keys",
         "Buttons held at power-on, e.g. power+camera (HBOOT), power+home "
         "(recovery), power+back (fastboot)");

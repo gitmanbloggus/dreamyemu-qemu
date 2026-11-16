@@ -13,6 +13,7 @@ const imageName = (v: unknown, d: string) =>
 
 export const sanitize = (raw: Partial<EmulatorConfig>, base: EmulatorConfig = DEFAULT_CONFIG): EmulatorConfig => {
   const c: EmulatorConfig = {
+    device: oneOf(raw.device, ["hd2", "dream"], base.device),
     baseband: oneOf(raw.baseband, ["hle", "lle"], base.baseband),
     dsp: oneOf(raw.dsp, ["hle", "lle"], base.dsp),
     usb: oneOf(raw.usb, ["hle", "lle"], base.usb),
@@ -68,6 +69,8 @@ export const nandOs = (name: string): NandOs => {
   return mbr && b[0x1be + 4] === 0x20 ? "winmo" : "other";
 };
 
+const DREAM_NAND_SIZE = 2048 * 64 * 2112;
+
 export const listImages = (): ImageFile[] => {
   let names: string[] = [];
   try {
@@ -80,8 +83,10 @@ export const listImages = (): ImageFile[] => {
     .sort()
     .map((name) => {
       const size = fs.statSync(path.join(IMAGES, name)).size;
-      if (name.startsWith("sdcard")) return { name, size, kind: "sdcard" } as ImageFile;
-      return { name, size, kind: "nand", os: nandOs(name) } as ImageFile;
+      if (name.startsWith("sdcard") || /(^|[_-])sd([_.-])/.test(name)) return { name, size, kind: "sdcard" } as ImageFile;
+      /* a Dream NAND is 2048 blocks of 64 msm-nand pages (2112 bytes); the HD2's is 4096 */
+      if (size === DREAM_NAND_SIZE) return { name, size, kind: "nand", os: "other", device: "dream" } as ImageFile;
+      return { name, size, kind: "nand", os: nandOs(name), device: "hd2" } as ImageFile;
     });
 };
 
@@ -117,4 +122,5 @@ export const firmware = (): Firmware => ({
   arm: exists(QEMU_ARM),
   hexagon: exists(QEMU_HEXAGON),
   vhci: canClaimVhciPort(),
+  spl: exists(path.join(IMAGES, "spl.bin")),
 });

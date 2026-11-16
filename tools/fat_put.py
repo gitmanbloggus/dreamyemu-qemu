@@ -2,7 +2,8 @@
 """Copy files into a FAT32 SD card image made by mksdcard.sh, no mounting.
 
 usage: fat_put.py sdcard.img DIR FILE...
-Creates DIR in the root directory if needed and writes each FILE into it,
+Creates DIR in the root directory if needed (DIR "/" is the root itself:
+RA-dream's "Flash zip from sdcard" lists the root) and writes each FILE into it,
 in contiguous clusters.  Every entry gets its 8.3 name (upper case, which
 HD2 kernels look files up by: IOS7/ROOTFS.HFS) and, when the real name
 differs from it (ios7, zImage, initrd.gz), a long-name entry the way
@@ -204,7 +205,7 @@ def main():
     if len(sys.argv) < 4:
         sys.exit(__doc__)
     fs = Fat32(sys.argv[1])
-    d = fs.mkdir(sys.argv[2])
+    d = fs.root if sys.argv[2] == '/' else fs.mkdir(sys.argv[2])
     for p in sys.argv[3:]:
         fs.put(d, os.path.basename(p), p)
         print('%s/%s: %d bytes' % (sys.argv[2].upper(),

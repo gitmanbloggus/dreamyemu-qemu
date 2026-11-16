@@ -9,6 +9,18 @@ this is where that work continues.
 
 Board: `src/qemu/hw/arm/dream/` (`dream.c`, `msm_mddi.c`).
 
+The web UI (`web/`, `npm run dev`) runs it too: Config -> Phone -> Machine
+"HTC Dream" (needs `images/spl.bin`). Dream NANDs are told apart by size
+(2048 x 64 x 2112 bytes), SD cards by a `sdcard*` or `*_sd*` name. Boot:
+normal, Recovery (`keys=home+power`) or HBOOT (`keys=power+back`). Typing
+goes to the QWERTY keypad as qcodes, the arrows roll the trackball, F10
+presses it. No adb or WiFi on this machine yet; audio is the aDSP's host
+PCM path (below).
+The keyboard button (or F11) slides the keyboard out through the machine's
+`keyboard-open` property (qom-get/qom-set on /machine): the drawn phone
+turns on its side, the screen slab slides up, and the chin stays with the
+clickable QWERTY keyboard. The rotate button turns the closed phone by hand.
+
 ## Run
 
 Third-party blobs stay out of git (`images/` is ignored): the 512 KiB SPL
@@ -82,6 +94,84 @@ Touch: the pointer over the screen is the finger (left button), with
 or the mouse wheel (vertical), press with the middle button or F10.
 Measured: tapping the android, the tip and "Next" walks the setup wizard
 to its account page; trackball Down + press opens the Emergency Dialer.
+
+### Custom recovery (RA-dream)
+
+`--recovery IMG` / `--boot IMG` write a boot image into that partition
+(after `--nbh`, so they override it) and erase the rest of it, as
+`fastboot flash` would. With RA-dream v1.7.0 (md5
+`4b9f198aa8ada3ca1ed5537e9c25e427`):
+
+```bash
+python3 tools/dream_nand.py --erase-aa --spl spl.bin --nbh DREAIMG-RC29.zip \
+    --recovery recovery-RA-dream-v1.7.0.img nand_bringup.img images/dream_nand_ra.img
+src/qemu/build/qemu-system-arm -M dream,keys=home+power -bios spl.bin \
+    -drive if=mtd,format=raw,file=images/dream_nand_ra.img -display sdl
+```
+
+Measured: Home+Power reaches RA's menu ("Build : RA-dream-v1.7.0") within
+25-75 s of power-on.
+
+### microSD
+
+SDC1 (0xA0400000, IRQs 24/25, the WiFi slot, empty) and SDC2 (0xA0500000,
+IRQs 26/27) are the HD2's `msm-sdcc`; `-drive if=sd,format=raw,file=...`
+puts a card in SDC2. Card detect is the CPLD's SDMC_CD_N at +0x0A, which
+already reads 0 (= card in). A card with FAT32 + ext2, the zip in the root:
+
+```bash
+truncate -s 1G images/dream_sd.img
+printf 'label: dos\n2048,1546240,c\n,,83\n' | sfdisk images/dream_sd.img
+#   mkfs.vfat -F 32 / mke2fs -t ext2 each partition, dd them in, then:
+python3 tools/fat_put.py images/dream_sd.img / rom.zip
+```
+
+Measured with RA-dream 1.7.0: "Flash zip from sdcard" lists the zip, and
+"Wipe data/factory reset" formats DATA and CACHE. Installing
+JACxHeroSki 2.2a stops at `set_perm_recursive ... SYSTEM:xbin` ("Can't
+chown/mod /system/xbin"): its ~80 MB /system does not fit the stock SPL's
+67.5 MB `system` (0x02E40000..0x071C0000); the ROM wants the Danger SPL's
+layout. Keys over the monitor need a hold time (`sendkey alt-f 400`);
+RA moves its selection with volume (PgDn), not the trackball, over QMP.
+
+### Bigger /system: CustomMTD
+
+Firerat's CustomMTD (xda t=717874) resizes system/cache/userdata with a
+`mtdparts=msm_nand:` table on the kernel command line, which the SPL
+passes through ("commandline from head") and both RA's 2.6.29 and
+JACxHeroSki's 2.6.29.6 kernels parse (cmdlinepart). Recovery is patched
+offline, the ROM's boot.img on the phone by FR-boot-v1.5.8-CustomMTD_S.zip,
+which copies the table from the running recovery's /proc/cmdline:
+
+```bash
+python3 tools/dream_custommtd.py 90 2 recovery-RA-dream-v1.7.0.img ra-mtd.img
+python3 tools/dream_nand.py --erase-aa --spl spl.bin --nbh DREAIMG-RC29.zip \
+    --recovery ra-mtd.img nand_bringup.img images/dream_nand_rom.img
+#   SD root: the ROM zip and FR-boot-v1.5.8-CustomMTD_S.zip
+#   -M dream,keys=home+power: Wipe data, flash the ROM, flash FR-boot,
+#   then power-cycle without keys= (a reset re-holds the combo)
+```
+
+Measured with JACxHeroSki 2.2a (system 90 MB, cache 2 MB): the install
+completes, FR-boot writes "Custom MTD written", and the ROM's kernel mounts
+mtdblock3/4/5 (system/cache/userdata) and the SD card (mmcblk0 p1 p2);
+init starts rild (SMD ch 0 opened), the Hero boot animation plays, and
+after ~8 min (first boot, dexopt) Menu wakes the panel on HTC Sense's lock
+screen (T-Mobile, battery full). com.android.phone force-closes once.
+
+Two modem fixes this needed (`smd-v1` only):
+- **RPCCALL never came up.** The 2.6.29 kernel starts its half of a
+  channel in OPENED, not OPENING, so the modem never sent the router
+  HELLO; every `msm_rpc_connect` failed -113, and `acoustic_open` (htc
+  acoustic, program 0x30100002, now announced too) oopsed on the error
+  pointer: panic, reboot every ~18 s.
+- **Battery.** htc_battery's GET_BATT_INFO (0x30100001 proc 2) got the
+  zeroed default, read as 0% with no charger, and Android powered off at
+  ~70 s (`PCOM_POWER_DOWN`). It now reads 100% on USB.
+
+Its kernel log is at PA 0x103E0000 (128 KiB), not the RC29 one's
+0x102C9000; logcat can be recovered from a RAM dump with the 20-byte
+logger_entry (v1) header. There is no USB/adb on `-M dream` yet.
 
 ### Past the setup wizard
 
@@ -333,6 +423,12 @@ Rust images' 0xAA fill there the line overflowed a stack buffer.
 - **MDDI list completion** is raised 20 us after PRI_PTR: raised at once,
   the kernel's ISR consumed PRI_LINK_LIST_DONE before the writer enabled
   it, and register writes waited out their timeouts.
+- **PPP rotation on MDP 2.2.** The driver points DST0 at the last 16-pixel
+  tile of a mirrored axis (ROT_90 xor FLIP_LR: + (w - 16) * bpp; FLIP_UD:
+  + (h - 16) rows), because MDP 2.2 writes it from that end. The PPP model
+  undoes it on `mddi` boards. Without that, landscape apps (Teeter's board,
+  its "continue playing?" dialog) landed 304 px right and wrapped 16 px
+  around the left edge. Measured for ROT_90; the flips follow the rule.
 - **Partial updates.** msm_fb sends dirty rectangles: DMA2 IBUF at the
   rectangle, its size, and the panel position in OUT_XY (0x10194).
 - **Keyboard slide** is SW_LID on GPIO 162 (CPLD bit 2, active low);
@@ -360,3 +456,56 @@ codeword 3's parity (where the SPL probes data+2064), and the factory
 marker at codeword 3 offset 464 with the displaced user byte at 526. The
 SPL reads it correctly (measured above). The kernel's CFG1 marker position
 is still unverified.
+
+## aDSP (qdsp5): audio and the video task
+
+`msm-adsp5` (`hw/arm/dream/msm_adsp5.c`) is the application DSP at
+0xAC000000 (IRQ 23). AMSS enables its tasks over RPC: `msm_rpc.c` now
+announces adsp_rtos, audmgr and snd at the AMSS 6225 versions the Dream's
+kernels connect to (`smd-v1` only), answers a task enable with a MOD_READY
+callback (0x3000000b), and answers audmgr's ENABLE_CLIENT with READY and
+CODEC_CONFIG callbacks (without them `audmgr_enable` BUG()s after 15 s).
+
+- AUDPPTASK: CFG enable/sleep and the host PCM interface behind
+  `/dev/msm_pcm_out` (AudioFlinger's output). Each ARM -> DSP buffer is
+  played on QEMU's audio backend (`-audio pa` / `-audiodev ...`) and asked
+  for again once its time has passed.
+- VIDEOTASK: the H.264 command/event sequence captured from stock Android
+  (htcdreamfulldriverdecomp `dsp/PLAN.md`): init -> msg 0, each subframe
+  packet -> msgs 2 and 4, the `b203` end packet -> msg 0. Each packet is
+  rebuilt into a plain H.264 stream (`dream_h264_rw.c`: the packet says how
+  many slice-header bits to skip, so a fresh header against a fixed SPS/PPS
+  replaces it) and decoded with libavcodec into the packet's output buffer
+  as NV21. Without libavcodec at build time the frames stay blank. The PPS
+  chroma QP offset is not in the packets: `msm-adsp5.vdec-chroma-qp-offset`
+  (default -2, x264's). Driven over qtest with the BBB clip's packets the
+  output is bit-exact with ffmpeg (240/240 frames).
+- Not modelled: AUDPLAY decoders (`/dev/msm_mp3`), recording, VFE/JPEG.
+
+`-global msm-adsp5.trace=on` logs every command and event; `-d unimp` shows
+the commands the model ignores.
+
+## Adreno 130 (`-M dream,gpu=on`, experimental)
+
+`msm-adreno130` (`hw/arm/dream/msm_adreno130.c`) models the GPU at
+0xA0000000 (IRQ 20) from captures of the stock libhgl.so driving the real
+GPU (htcdreamfulldriverdecomp `hgl/gputrace/`: `regtrace.c` traps every
+register access and copies each command buffer as it is submitted).
+It runs the command processor (ring, indirect buffers, PM4 type 0/3,
+read-pointer writeback, timestamp, IRQ), the vertex pass (fixed-function
+transform from the matrix constants) and a rasterizer with Gouraud/flat
+shading, culling, scissor, blending, a 16-bit depth test and one texture
+(RGBA8888/RGB565, nearest/linear, clamp/repeat, modulate/replace) into the
+on-chip RGB565 render target at window +0x20000.
+
+It is off by default: with the window unmapped libhgl fails its chip
+check and Android draws in software. A GPU that passes it must draw
+everything SurfaceFlinger asks for, and window-sized surfaces (the
+render target pitch is fixed at 64, `fb-pitch`), strips, more texture
+formats, mipmaps and the vertex program microcode are not modelled yet.
+
+Checked by replaying the captures over qtest (`hgl/gputrace/replay.py`):
+of 24 phone frames, the untextured ones match to within the phone's
+dithering (worst 15/255 per channel; flat, depth-mask and depth-range
+exactly), textured ones too except for a few texel-boundary pixels with
+repeat wrap and 8x8 textures.

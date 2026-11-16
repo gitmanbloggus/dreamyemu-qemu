@@ -43,6 +43,7 @@ boot.img normally and recovery only when asked. NBH item table: types at
 
 Usage:
     python3 tools/dream_nand.py [--erase-aa] [--spl SPL.bin] [--nbh RUU.nbh]
+                                [--recovery REC.img] [--boot BOOT.img]
                                 IN.img OUT.img
 """
 
@@ -53,6 +54,11 @@ REC = PAGE + SPARE
 CW_USER, CW_RAW = 516, 528
 BB_POS = PAGE - 3 * CW_RAW          # 464
 APPSBL_BLOCK = 0x120
+# --recovery/--boot IMG: Linux mtd offset, size (trout: recovery 5 MiB,
+# boot 2.5 MiB). Applied after --nbh, so they override its images; the
+# rest of the partition is erased (0xFF), as fastboot flash leaves it.
+PARTS = {"--recovery": (0x026C0000, 0x500000),
+         "--boot": (0x02BC0000, 0x280000)}
 
 
 def converte_pagina(rec):
@@ -108,6 +114,14 @@ def main(argv):
         del argv[i:i + 2]
         for ty, off in ((0xB05, 0x026C0000), (0xB04, 0x02BC0000)):
             parts[off // PAGE] = nbh_item(nbh, ty)
+    for flag, (off, size) in PARTS.items():
+        if flag in argv:
+            i = argv.index(flag)
+            img = open(argv[i + 1], "rb").read()
+            del argv[i:i + 2]
+            if len(img) > size:
+                raise SystemExit(f"{flag}: {len(img)} B > partition {size} B")
+            parts[off // PAGE] = img.ljust(size, b"\xff")
     if len(argv) != 3:
         print(__doc__.split("Usage:")[1].strip())
         return 2

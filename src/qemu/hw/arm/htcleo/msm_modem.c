@@ -879,6 +879,17 @@ static void smd_scan(MsmModemState *s, bool dsp)
         apps_st = smem_rd(s, c.apps + HC_STATE);
         modem_st = smem_rd(s, c.modem + HC_STATE);
 
+        /*
+         * 2.6.29 trout kernels (smd_alloc_channel) start the apps half
+         * straight in OPENED, never OPENING (measured: "SMD: ch 2 CLOSED
+         * -> OPENED" with no open seen here, so RPCCALL never got the
+         * router HELLO and every msm_rpc_connect failed -113).  On smd-v1
+         * treat that like OPENING.
+         */
+        if (s->smd_v1 && apps_st == SMD_SS_OPENED && modem_st != SMD_SS_OPENED) {
+            apps_st = SMD_SS_OPENING;
+        }
+
         switch (apps_st) {
         case SMD_SS_OPENING:
             if (modem_st != SMD_SS_OPENED) {
@@ -1056,6 +1067,13 @@ static void smem_build_v1(MsmModemState *s)
     uint32_t next = SMEM_HEAP_START, tbl;
 
     memset(s->smem, 0, SMEM_HEAP_START);
+    /*
+     * version[] (after the four proc_comm slots): a Dream's AMSS writes
+     * 0x000a0003 (SMEM version 10) to the SBL (7) and modem (9) entries;
+     * mainline's qcom_smem checks entry 7.
+     */
+    smem_wr(s, 0x40 + 7 * 4, 0x000a0003);
+    smem_wr(s, 0x40 + 9 * 4, 0x000a0003);
     tbl = smem_build_alloc(s, SMEM_CHANNEL_ALLOC_TBL, SMD_NUM_CH * 32, &next);
     for (int i = 0; i < ARRAY_SIZE(chans); i++) {
         uint32_t e = tbl + i * 32;
@@ -1064,8 +1082,19 @@ static void smem_build_v1(MsmModemState *s)
         smem_wr(s, e + 20, chans[i].cid);
         smem_wr(s, e + 24, 0);
         smem_wr(s, e + 28, 1);
-        smem_build_alloc(s, SMEM_SMD_BASE_ID + chans[i].cid,
-                         2 * (HC_SIZE + SMD_V1_BUF), &next);
+        uint32_t ch = smem_build_alloc(s, SMEM_SMD_BASE_ID + chans[i].cid,
+                                       2 * (HC_SIZE + SMD_V1_BUF), &next);
+        /*
+         * A Dream's AMSS hands over with its half of every channel in
+         * OPENING, DSR/CTS/CD up and fSTATE set (SMEM dump of a phone
+         * booted by HBOOT); the apps side is CLOSED.
+         */
+        uint32_t modem = ch + HC_SIZE + SMD_V1_BUF;
+        smem_wr(s, modem + HC_STATE, SMD_SS_OPENING);
+        smem_wrb(s, modem + HC_FDSR, 1);
+        smem_wrb(s, modem + HC_FCTS, 1);
+        smem_wrb(s, modem + HC_FCD, 1);
+        smem_wrb(s, modem + HC_FSTATE, 1);
     }
     smem_build_alloc(s, SMEM_SMEM_SLOW_CLOCK_VALUE, 4, &next);
     smem_build_alloc(s, SMEM_SMSM_SHARED_STATE, 4 * 4, &next);

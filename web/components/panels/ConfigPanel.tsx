@@ -1,6 +1,6 @@
 "use client";
 
-import { Cpu, Gauge, HardDrive, Headphones, Layers, MemoryStick, Radio, Terminal, Wifi, Signal, Usb, Film, Sparkles, Bug } from "lucide-react";
+import { Cpu, Gauge, HardDrive, Headphones, Layers, MemoryStick, Radio, Smartphone, Terminal, Wifi, Signal, Usb, Film, Sparkles, Bug } from "lucide-react";
 import { Category, Checkbox, Divider, EditTextPref, ListPref, PrefRow, SeekPref, Switch, type Choice } from "@/components/holo";
 import type { EmulatorConfig, Firmware, ImageFile } from "@/lib/emulator-types";
 
@@ -14,9 +14,115 @@ type Props = {
   onChange: (patch: Partial<EmulatorConfig>) => void;
 };
 
+const StreamPrefs = ({ config, onChange }: Pick<Props, "config" | "onChange">) => (
+  <>
+    <Category>Screen stream</Category>
+    <ListPref
+      title="Encoder"
+      icon={<Film {...I} />}
+      value={config.encoder}
+      choices={[
+        { value: "x264", label: "x264 (CPU)", summary: "Lowest latency at this size" },
+        { value: "nvenc", label: "NVENC (NVIDIA GPU)" },
+      ]}
+      onChange={(encoder) => onChange({ encoder })}
+    />
+    <SeekPref
+      title="Picture quality"
+      value={50 - config.quality}
+      min={10}
+      max={40}
+      format={(v) => `CRF ${50 - v}`}
+      onCommit={(v) => onChange({ quality: 50 - v })}
+    />
+    <SeekPref title="Frame rate limit" value={config.maxFps} min={10} max={60} step={5} format={(v) => `${v} fps`} onCommit={(maxFps) => onChange({ maxFps })} />
+    <p className="px-4 text-[12.5px] text-holo-text-3">Stream settings apply at once. The others take effect when the emulator restarts.</p>
+  </>
+);
+
 export const ConfigPanel = ({ config, images, firmware, onChange }: Props) => {
-  const nands = images.filter((i) => i.kind === "nand");
+  const dream = config.device === "dream";
+  const nands = images.filter((i) => i.kind === "nand" && (i.device ?? "hd2") === config.device);
   const sds = images.filter((i) => i.kind === "sdcard");
+
+  const setDevice = (device: EmulatorConfig["device"]) => {
+    const patch: Partial<EmulatorConfig> = { device };
+    const own = images.filter((i) => i.kind === "nand" && (i.device ?? "hd2") === device);
+    if (!own.some((i) => i.name === config.nand) && own.length) patch.nand = own[0].name;
+    patch.boot = "nand";
+    onChange(patch);
+  };
+
+  const devicePref = (
+    <>
+      <Category>Phone</Category>
+      <ListPref
+        title="Machine"
+        icon={<Smartphone {...I} />}
+        value={config.device}
+        choices={[
+          { value: "hd2", label: "HTC HD2 (-M htcleo)", summary: "QSD8250: cLK, MAGLDR or Windows Mobile NAND" },
+          {
+            value: "dream",
+            label: "HTC Dream / T-Mobile G1 (-M dream)",
+            summary: firmware.spl ? "MSM7201A: its SPL boots the NAND (docs/dream.md)" : "Needs images/spl.bin",
+            disabled: !firmware.spl,
+          },
+        ]}
+        onChange={setDevice}
+      />
+    </>
+  );
+
+  if (dream) {
+    return (
+      <div className="pb-8">
+        {devicePref}
+        <Category>Images</Category>
+        <ListPref
+          title="NAND flash"
+          icon={<MemoryStick {...I} />}
+          value={config.nand}
+          choices={nands.map((n) => ({ value: n.name, label: n.name, summary: gb(n.size) }))}
+          onChange={(nand) => onChange({ nand })}
+        />
+        {!nands.length && <p className="px-4 pb-2 pl-16 text-[12.5px] text-holo-text-3">No Dream NAND in images/ (tools/dream_nand.py makes one).</p>}
+        <Divider />
+        <ListPref
+          title="microSD card"
+          icon={<HardDrive {...I} />}
+          value={config.sdcard}
+          choices={[{ value: "", label: "No card" }, ...sds.map((n) => ({ value: n.name, label: n.name, summary: gb(n.size) }))]}
+          onChange={(sdcard) => onChange({ sdcard })}
+        />
+        <Divider />
+        <ListPref
+          title="Boot"
+          icon={<Layers {...I} />}
+          value={config.boot}
+          choices={[
+            { value: "nand", label: "Normal boot", summary: "The SPL boots the boot partition" },
+            { value: "recovery", label: "Recovery", summary: "Holds Home + Power at power-on (and at every reset)" },
+            { value: "menu", label: "HBOOT", summary: "Holds Back + Power: the bootloader's rainbow screen" },
+          ]}
+          onChange={(boot) => onChange({ boot })}
+        />
+        <p className="px-4 pb-2 pl-16 text-[12.5px] text-holo-text-3">
+          Typing goes to the Dream&apos;s QWERTY keypad; the arrow keys roll the trackball and F10 presses it, F11 slides the keyboard out. No
+          audio, adb or WiFi on this machine yet.
+        </p>
+        <StreamPrefs config={config} onChange={onChange} />
+        <Category>Debugging</Category>
+        <EditTextPref
+          title="Extra QEMU arguments"
+          icon={<Terminal {...I} />}
+          value={config.extraArgs}
+          placeholder="None"
+          onChange={(extraArgs) => onChange({ extraArgs })}
+        />
+      </div>
+    );
+  }
   /* a stock Windows Mobile ROM: it runs on the real baseband and boots without the cLK menu */
   const winmo = nands.some((i) => i.name === config.nand && i.os === "winmo");
 
@@ -74,6 +180,7 @@ export const ConfigPanel = ({ config, images, firmware, onChange }: Props) => {
 
   return (
     <div className="pb-8">
+      {devicePref}
       <Category>Processors</Category>
       <ListPref title="Baseband (modem core)" icon={<Radio {...I} />} value={config.baseband} choices={basebandChoices} onChange={setBaseband} />
       <Divider />
@@ -195,27 +302,7 @@ export const ConfigPanel = ({ config, images, firmware, onChange }: Props) => {
         onChange={(v) => onChange({ adbPort: Number(v) || 5555 })}
       />
 
-      <Category>Screen stream</Category>
-      <ListPref
-        title="Encoder"
-        icon={<Film {...I} />}
-        value={config.encoder}
-        choices={[
-          { value: "x264", label: "x264 (CPU)", summary: "Lowest latency at this size" },
-          { value: "nvenc", label: "NVENC (NVIDIA GPU)" },
-        ]}
-        onChange={(encoder) => onChange({ encoder })}
-      />
-      <SeekPref
-        title="Picture quality"
-        value={50 - config.quality}
-        min={10}
-        max={40}
-        format={(v) => `CRF ${50 - v}`}
-        onCommit={(v) => onChange({ quality: 50 - v })}
-      />
-      <SeekPref title="Frame rate limit" value={config.maxFps} min={10} max={60} step={5} format={(v) => `${v} fps`} onCommit={(maxFps) => onChange({ maxFps })} />
-      <p className="px-4 text-[12.5px] text-holo-text-3">Stream settings apply at once. The others take effect when the emulator restarts.</p>
+      <StreamPrefs config={config} onChange={onChange} />
 
       <Category>Debugging</Category>
       <PrefRow

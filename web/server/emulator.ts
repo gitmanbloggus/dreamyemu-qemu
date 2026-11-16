@@ -10,6 +10,7 @@ import { VncClient } from "./vnc.ts";
 import { StreamHub } from "./stream.ts";
 import {
   HARD_KEY_QCODE,
+  hardKeyQcode,
   type Cable,
   type EmulatorConfig,
   type EmulatorStatus,
@@ -84,6 +85,7 @@ export class Emulator extends EventEmitter {
   private pids: { arm?: number; hexagon?: number } = {};
   private touch = { x: 0, y: 0, down: false };
   private sensors = { battery: 100, cable: "usb" as Cable };
+  private keyboard = false;
   private op: Promise<void> = Promise.resolve();
 
   constructor(hub: StreamHub) {
@@ -102,6 +104,7 @@ export class Emulator extends EventEmitter {
       pids: this.pids,
       stream: this.hub.statsSnapshot,
       sensors: this.sensors,
+      keyboard: this.keyboard,
     };
   }
 
@@ -172,10 +175,46 @@ export class Emulator extends EventEmitter {
   async reset() {
     if (!this.qmp) throw new Error("The emulator is not running");
     await this.qmp.execute("system_reset");
-    if (this.running && this.running.boot !== "menu") void this.bootKeys(this.running);
+    await this.refreshKeyboard();
+    this.emit("status");
+    if (this.running && this.running.device !== "dream" && this.running.boot !== "menu") void this.bootKeys(this.running);
+  }
+
+  /*
+   * -M dream (docs/dream.md): the SPL as -bios, the NAND, the microSD.  No
+   * cLK menu: the boot target is a key combo held from power-on (keys=),
+   * which a board reset holds again.  No audio, adb, WiFi or Adreno there.
+   */
+  private async launchDream(cfg: EmulatorConfig) {
+    for (const f of ["qmp.sock", "webqmp.sock", "vnc.sock", "qemu.log"]) fs.rmSync(path.join(IMAGES, f), { force: true });
+    if (!fs.existsSync(path.join(IMAGES, cfg.nand))) throw new Error(`NAND image ${cfg.nand} not found in images/`);
+    if (!fs.existsSync(path.join(IMAGES, "spl.bin"))) throw new Error("images/spl.bin (the Dream's SPL) is missing");
+    const keys = cfg.boot === "recovery" ? ",keys=home+power" : cfg.boot === "menu" ? ",keys=power+back" : "";
+    const args = [
+      "-L", QEMU_PCBIOS, "-L", QEMU_PCBIOS_BUILD,
+      "-M", `dream${keys}`,
+      "-bios", "spl.bin",
+      "-drive", `if=mtd,format=raw,file=${cfg.nand}`,
+      "-display", "none",
+      "-vnc", `unix:${SOCK.vnc}`,
+      "-serial", "file:uart1.log",
+      "-qmp", `unix:${SOCK.qmp},server,nowait`,
+      "-qmp", `unix:${SOCK.webqmp},server,nowait`,
+      "-d", "unimp,guest_errors", "-D", "qemu.log",
+    ];
+    if (cfg.sdcard && fs.existsSync(path.join(IMAGES, cfg.sdcard))) args.push("-drive", `if=sd,format=raw,file=${cfg.sdcard}`);
+    args.push(...splitArgs(cfg.extraArgs));
+
+    this.arm = this.spawn(QEMU_ARM, args, "qemu.out", "arm");
+    this.running = cfg;
+    this.external = false;
+    fs.writeFileSync(RUN_FILE, JSON.stringify(cfg));
+    if (!(await waitFor(SOCK.webqmp, 8000))) throw new Error(`QEMU did not start:\n${tail("qemu.out")}`);
+    await this.attach();
   }
 
   private async launch(cfg: EmulatorConfig) {
+    if (cfg.device === "dream") return this.launchDream(cfg);
     /*
      * Windows Mobile boots straight from NAND (the machine finds the ROM's
      * XIP partition) and needs the real baseband; no cLK menu to drive
@@ -351,6 +390,7 @@ export class Emulator extends EventEmitter {
   }
 
   private cleanupClients() {
+    this.keyboard = false;
     this.vnc?.close();
     this.q6vnc?.close();
     this.qmp?.close();
@@ -386,8 +426,13 @@ export class Emulator extends EventEmitter {
   input(m: InputMessage) {
     if (!this.qmp) return;
     if (m.t === "key") {
-      const q = HARD_KEY_QCODE[m.k as HardKey];
-      if (q) this.sendQcode(q, m.d);
+      if (!(m.k in HARD_KEY_QCODE)) return;
+      this.sendQcode(hardKeyQcode(this.running?.device ?? "hd2", m.k as HardKey), m.d);
+      return;
+    }
+    if (m.t === "qkey") {
+      /* the Dream's QWERTY keypad; anything but a plain qcode name is dropped */
+      if (this.running?.device === "dream" && typeof m.q === "string" && /^[a-z0-9_]{1,16}$/.test(m.q)) this.sendQcode(m.q, !!m.d);
       return;
     }
     const x = Math.round(Math.min(1, Math.max(0, m.x)) * 0x7fff);
@@ -404,7 +449,29 @@ export class Emulator extends EventEmitter {
     if (events.length) this.qmp.send("input-send-event", { events });
   }
 
+  /* -M dream's keyboard slide (SW_LID), read back so F11 on the guest side stays in step */
+  async refreshKeyboard() {
+    if (!this.qmp || this.running?.device !== "dream") {
+      this.keyboard = false;
+      return;
+    }
+    try {
+      this.keyboard = !!(await this.qmp.execute("qom-get", { path: "/machine", property: "keyboard-open" }));
+    } catch {
+      /* builds before keyboard-open */
+    }
+  }
+
+  async setKeyboard(open: boolean) {
+    if (!this.qmp) throw new Error("The emulator is not running");
+    if (this.running?.device !== "dream") throw new Error("Only the Dream has a keyboard to slide out");
+    await this.qmp.execute("qom-set", { path: "/machine", property: "keyboard-open", value: open });
+    await this.refreshKeyboard();
+    this.emit("status");
+  }
+
   async refreshSensors() {
+    void this.refreshKeyboard();
     if (!this.qmp) return this.sensors;
     try {
       const cable = (await this.qmp.execute("qom-get", { path: "/machine", property: "cable" })) as Cable;

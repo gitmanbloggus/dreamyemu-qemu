@@ -207,6 +207,16 @@ static uint64_t csr_read(void *opaque, hwaddr off, unsigned size)
     if (off >= 0x400 && off < 0x400 + 4 * CSR_NUM_A2M) {
         return 0;
     }
+    /*
+     * MSM7x01A A11S_VDD_SVS_PLEVEL (+0x124): bits 5:3 are the core voltage
+     * level asked for, bits 2:0 the level reached, which acpuclock checks
+     * after each request.  The supply follows at once here.
+     */
+    if (off == 0x124 && s->dgt_free_running) {
+        uint32_t v = s->regs[0x124 >> 2];
+
+        return (v & ~7u) | ((v >> 3) & 7);
+    }
     return s->regs[(off >> 2) & 0x3ff];
 }
 
