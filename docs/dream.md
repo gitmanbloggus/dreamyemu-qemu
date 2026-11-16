@@ -341,3 +341,28 @@ CODEC_CONFIG callbacks (without them `audmgr_enable` BUG()s after 15 s).
 
 `-global msm-adsp5.trace=on` logs every command and event; `-d unimp` shows
 the commands the model ignores.
+
+## Adreno 130 (`-M dream,gpu=on`, experimental)
+
+`msm-adreno130` (`hw/arm/dream/msm_adreno130.c`) models the GPU at
+0xA0000000 (IRQ 20) from captures of the stock libhgl.so driving the real
+GPU (htcdreamfulldriverdecomp `hgl/gputrace/`: `regtrace.c` traps every
+register access and copies each command buffer as it is submitted).
+It runs the command processor (ring, indirect buffers, PM4 type 0/3,
+read-pointer writeback, timestamp, IRQ), the vertex pass (fixed-function
+transform from the matrix constants) and a rasterizer with Gouraud/flat
+shading, culling, scissor, blending, a 16-bit depth test and one texture
+(RGBA8888/RGB565, nearest/linear, clamp/repeat, modulate/replace) into the
+on-chip RGB565 render target at window +0x20000.
+
+It is off by default: with the window unmapped libhgl fails its chip
+check and Android draws in software. A GPU that passes it must draw
+everything SurfaceFlinger asks for, and window-sized surfaces (the
+render target pitch is fixed at 64, `fb-pitch`), strips, more texture
+formats, mipmaps and the vertex program microcode are not modelled yet.
+
+Checked by replaying the captures over qtest (`hgl/gputrace/replay.py`):
+of 24 phone frames, the untextured ones match to within the phone's
+dithering (worst 15/255 per channel; flat, depth-mask and depth-range
+exactly), textured ones too except for a few texel-boundary pixels with
+repeat wrap and 8x8 textures.

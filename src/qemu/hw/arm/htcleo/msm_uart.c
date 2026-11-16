@@ -3,7 +3,7 @@
  *
  * Register map from drivers/serial/msm_serial.h:
  *   0x00 MR1  0x04 MR2  0x08 SR(read)/CSR(write)  0x0C RF(read)/TF(write)
- *   0x10 CR   0x14 ISR(read)/IMR(write)  0x18 IPR  0x1C TFWR  0x20 RFWR
+ *   0x10 MISR(read)/CR(write)   0x14 ISR(read)/IMR(write)  0x18 IPR  0x1C TFWR  0x20 RFWR
  *   0x24 HCR
  *
  * This code is licensed under the GNU GPL v2 or later.
@@ -91,7 +91,7 @@ static uint64_t uart_read(void *opaque, hwaddr off, unsigned size)
         qemu_chr_fe_accept_input(&s->chr);
         uart_update(s);
         return v;
-    case 0x10: return s->cr;
+    case 0x10: return uart_isr(s) & s->imr;     /* MISR: masked status */
     case 0x14: return uart_isr(s);
     case 0x18: return s->ipr;
     case 0x1C: return s->tfwr;

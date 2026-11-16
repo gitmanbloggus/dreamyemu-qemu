@@ -1,0 +1,6 @@
+#ifndef HW_ARM_DREAM_MSM_ADRENO130_H
+#define HW_ARM_DREAM_MSM_ADRENO130_H
+
+#define TYPE_MSM_ADRENO130 "msm-adreno130"
+
+#endif

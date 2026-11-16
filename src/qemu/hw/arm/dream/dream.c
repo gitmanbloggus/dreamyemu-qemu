@@ -56,6 +56,7 @@
 #include "../htcleo/msm_regfile.h"
 #include "msm_mddi.h"
 #include "msm_adsp5.h"
+#include "msm_adreno130.h"
 #include "../htcleo/msm_mdp.h"
 #include "dream_input.h"
 #include "dream_synaptics.h"
@@ -82,6 +83,7 @@
 #define DREAM_PMDH_PHYS         0xAA600000
 #define DREAM_VIC_PHYS          0xC0000000
 #define DREAM_CSR_PHYS          0xC0100000
+#define DREAM_GPU_PHYS          0xA0000000      /* Adreno 130, 1 MiB */
 #define DREAM_AD5_PHYS          0xAC000000      /* aDSP (qdsp5) */
 #define DREAM_SMEM_PHYS         0x01F00000      /* inside SMI */
 
@@ -100,6 +102,7 @@
 #define DREAM_INT_GPIO_GROUP1       32
 #define DREAM_INT_GPIO_GROUP2       33
 #define DREAM_INT_PWB_I2C           34
+#define DREAM_INT_GRAPHICS          20      /* hw3d */
 #define DREAM_INT_NAND_WR_ER_DONE   36
 #define DREAM_INT_NAND_OP_DONE      37
 #define DREAM_INT_SDC1_0            24      /* irqs-7x00.h */
@@ -107,6 +110,8 @@
 #define DREAM_INT_SDC2_0            26
 #define DREAM_INT_SDC2_1            27
 
+#define DREAM_HSUSB_PHYS        0xA0800000
+#define DREAM_INT_USB_HS            47
 #define DREAM_SDC1_PHYS         0xA0400000      /* WiFi (SDIO), no card */
 #define DREAM_SDC2_PHYS         0xA0500000      /* the microSD slot */
 
@@ -146,6 +151,7 @@ static void dream_modem_reset(void *opaque)
 }
 
 static char *dream_boot_keys;
+static bool dream_gpu;          /* -M dream,gpu=on: model the Adreno 130 */
 
 static void dream_dma2_to_panel(void *opaque, uint32_t base, uint32_t stride,
                                 int w, int h, int x, int y)
@@ -277,6 +283,20 @@ static void dream_init(MachineState *machine)
                                 qdev_get_gpio_in(vic, DREAM_INT_ADSP_A11));
     qemu_register_reset(dream_modem_reset, modem);
 
+    /*
+     * Adreno 130: opt-in.  Unmapped, libhgl fails its chip check and
+     * Android draws in software; the model only draws what the phone
+     * captures cover so far (msm_adreno130.c).
+     */
+    if (dream_gpu) {
+        dev = qdev_new(TYPE_MSM_ADRENO130);
+        object_property_add_child(OBJECT(machine), "adreno130", OBJECT(dev));
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, DREAM_GPU_PHYS);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_GRAPHICS));
+    }
+
     /* aDSP: task enables come over the modem's adsp_rtos RPC server */
     dev = qdev_new(TYPE_MSM_ADSP5);
     object_property_add_child(OBJECT(machine), "adsp", OBJECT(dev));
@@ -362,6 +382,17 @@ static void dream_init(MachineState *machine)
         }
     }
 
+    /*
+     * High-speed USB (ChipIdea "msm72k", device mode): the HD2's model
+     * with its built-in host, which enumerates the gadget and pipes an
+     * adb interface to -global msm-hsusb.adb=<chardev>.
+     */
+    dev = qdev_new(TYPE_MSM_HSUSB);
+    sbd = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, DREAM_HSUSB_PHYS);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, DREAM_INT_USB_HS));
+
     dev = qdev_new(TYPE_MSM_NAND);
     qdev_prop_set_uint32(dev, "flash-id", DREAM_NAND_ID);
     qdev_prop_set_uint32(dev, "blocks", DREAM_NAND_BLOCKS);
@@ -426,6 +457,16 @@ static void dream_init(MachineState *machine)
     }
 }
 
+static bool dream_get_gpu(Object *obj, Error **errp)
+{
+    return dream_gpu;
+}
+
+static void dream_set_gpu(Object *obj, bool on, Error **errp)
+{
+    dream_gpu = on;
+}
+
 static bool dream_get_kbd(Object *obj, Error **errp)
 {
     return dream_input_keyboard_open();
@@ -452,6 +493,10 @@ static void dream_machine_class_init(ObjectClass *oc, const void *data)
     mc->no_floppy = true;
     mc->no_parallel = true;
     object_class_property_add_str(oc, "keys", dream_get_keys, dream_set_keys);
+    object_class_property_add_bool(oc, "gpu", dream_get_gpu, dream_set_gpu);
+    object_class_property_set_description(oc, "gpu",
+        "Model the Adreno 130 at 0xA0000000 (experimental; Android then "
+        "takes the GPU path)");
     object_class_property_add_bool(oc, "keyboard-open", dream_get_kbd,
                                    dream_set_kbd);
     object_class_property_set_description(oc, "keyboard-open",
