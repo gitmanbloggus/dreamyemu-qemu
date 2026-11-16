@@ -34,6 +34,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "net/net.h"
 #include "qemu/units.h"
 #include "qemu/timer.h"
 #include "qemu/error-report.h"
@@ -70,6 +71,8 @@
 #define DREAM_EBI1_BASE         0x10000000
 #define DREAM_EBI1_SIZE         (128 * MiB)
 
+#define DREAM_SDC1_PHYS         0xA0400000      /* WiFi (SDIO) */
+#define DREAM_SDC2_PHYS         0xA0500000      /* microSD */
 #define DREAM_NAND_PHYS         0xA0A00000
 #define DREAM_CLK_CTL_PHYS      0xA8600000
 #define DREAM_GPIO1_PHYS        0xA9200000
@@ -99,6 +102,13 @@
 #define DREAM_INT_ADM_AARM          21
 #define DREAM_INT_ADSP_A11          22
 #define DREAM_INT_ADSP_A9_A11       23      /* the qdsp5 driver's IRQ */
+#define DREAM_AD5_PHYS              0xAC000000
+/* the qdsp5 driver's request_irq(0x17) (msm_adsp_probe) */
+#define DREAM_INT_ADSP_A9_A11       23
+#define DREAM_INT_SDC1_0            24
+#define DREAM_INT_SDC1_1            25
+#define DREAM_INT_SDC2_0            26
+#define DREAM_INT_SDC2_1            27
 #define DREAM_INT_GPIO_GROUP1       32
 #define DREAM_INT_GPIO_GROUP2       33
 #define DREAM_INT_PWB_I2C           34
@@ -188,6 +198,7 @@ static void dream_init(MachineState *machine)
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *smi = g_new(MemoryRegion, 1);
     DeviceState *vic, *csr, *modem, *mdp, *mddi, *adm, *dev;
+    DeviceState *vic, *csr, *modem, *mdp, *mddi, *dev, *adm;
     MsmGpioState *gpio;
     I2CBus *i2c;
     DeviceState *ts;
@@ -265,6 +276,8 @@ static void dream_init(MachineState *machine)
     qdev_prop_set_bit(modem, "amss-hook", false);
     qdev_prop_set_bit(modem, "smd-v1", true);
     msm_csr_set_modem(csr, modem);
+    /* packet data (rmnet over QMI) goes to -nic ...,model=msm-modem */
+    qemu_configure_nic_device(modem, false, NULL);
     object_property_add_child(OBJECT(machine), "modem", OBJECT(modem));
     qdev_realize_and_unref(modem, NULL, &error_fatal);
     msm_modem_set_smem(MSM_MODEM(modem),
@@ -281,6 +294,9 @@ static void dream_init(MachineState *machine)
     }
     qdev_connect_gpio_out_named(modem, "m2a", M2A_DSP,
                                 qdev_get_gpio_in(vic, DREAM_INT_ADSP_A11));
+    /* the ADSP (QDSP5) window, PA 0xAC000000 (vmlinux iotable: AD5) */
+    msm_qdsp5_init(MSM_MODEM(modem), sysmem, DREAM_AD5_PHYS,
+                   qdev_get_gpio_in(vic, DREAM_INT_ADSP_A9_A11));
     qemu_register_reset(dream_modem_reset, modem);
 
     /*
@@ -421,6 +437,42 @@ static void dream_init(MachineState *machine)
     /* the Synaptics touchscreen, attention on CPLD GPIO 167 */
     ts = DEVICE(i2c_slave_create_simple(i2c, TYPE_DREAM_SYNAPTICS, 0x20));
     dream_input_init(gpio, dream_boot_keys, ts);
+
+    /*
+     * SD controllers (the HD2's model; MSM7x01A SDC1/SDC2, IRQs 24-27):
+     * SDC1 is the WiFi SDIO slot (no card), SDC2 the microSD slot, card
+     * switch on CPLD GPIO 176.  -drive if=sd puts a card in.
+     */
+    for (int i = 0; i < 2; i++) {
+        static const hwaddr base[2] = { DREAM_SDC1_PHYS, DREAM_SDC2_PHYS };
+        static const int irq[2][2] = {
+            { DREAM_INT_SDC1_0, DREAM_INT_SDC1_1 },
+            { DREAM_INT_SDC2_0, DREAM_INT_SDC2_1 },
+        };
+
+        dev = qdev_new(TYPE_MSM_SDCC);
+        sbd = SYS_BUS_DEVICE(dev);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, base[i]);
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vic, irq[i][0]));
+        sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(vic, irq[i][1]));
+        msm_sdcc_connect_adm(dev, adm, base[i]);
+        if (i == 1) {
+            qdev_connect_gpio_out_named(dev, "card-detect", 0,
+                                        dream_input_sd_detect());
+            dinfo = drive_get(IF_SD, 0, 0);
+            if (dinfo) {
+                DeviceState *card = qdev_new(TYPE_SD_CARD);
+
+                qdev_prop_set_drive_err(card, "drive",
+                                        blk_by_legacy_dinfo(dinfo),
+                                        &error_fatal);
+                qdev_realize_and_unref(card,
+                                       qdev_get_child_bus(dev, "sd-bus"),
+                                       &error_fatal);
+            }
+        }
+    }
 
     mdp = dev = qdev_new(TYPE_MSM_MDP);
     qdev_prop_set_bit(dev, "mddi", true);

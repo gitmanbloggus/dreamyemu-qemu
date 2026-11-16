@@ -44,9 +44,9 @@ static const GpioBank banks[NUM_BANKS] = {
 };
 
 /*
- * MSM7x01A (the Dream): five banks, pins 0-106, from the 2.6.25 trout
- * kernel's arch/arm/mach-msm/gpio_hw.h as recalled, not yet checked
- * against a disassembly.  GPIO1's banks interleave by 4 from OUT 0x00,
+ * MSM7x01A (the Dream): six banks, pins 0-121.  Banks 0-4 from the
+ * 2.6.25 trout kernel's arch/arm/mach-msm/gpio_hw.h as recalled (bank 4
+ * since checked against msm_gpio_chips[]); bank 5 read from that table.  GPIO1's banks interleave by 4 from OUT 0x00,
  * OE 0x10, IN 0x34, EDGE 0x60, POS 0x70, EN 0x80, CLEAR 0x90,
  * STATUS 0xA0; bank 1 (GPIO2) has the same layout as on the QSD8x50.
  */
@@ -56,6 +56,12 @@ static const GpioBank banks_7x01a[] = {
     {  43,  67, 0, 0x04, 0x14, 0x38, 0x64, 0x74, 0x84, 0x94, 0xA4 },
     {  68,  94, 0, 0x08, 0x18, 0x3C, 0x68, 0x78, 0x88, 0x98, 0xA8 },
     {  95, 106, 0, 0x0C, 0x1C, 0x40, 0x6C, 0x7C, 0x8C, 0x9C, 0xAC },
+    /*
+     * From the trout kernel's msm_gpio_chips[] (vmlinux 0x29D030): the
+     * keyboard's eighth column is GPIO 109.  Without this bank the column
+     * read as undriven and its keys (3 e x f d ...) ghosted down the rows.
+     */
+    { 107, 121, 0, 0x50, 0x54, 0x44, 0xC0, 0xBC, 0xB8, 0xB4, 0xB0 },
 };
 
 #define PROC_APPS   0

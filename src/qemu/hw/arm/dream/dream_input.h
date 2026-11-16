@@ -10,4 +10,7 @@ void dream_input_init(MsmGpioState *gpio, const char *boot_keys,
 bool dream_input_keyboard_open(void);
 void dream_input_set_keyboard_open(bool open);
 
+/* the microSD slot's card switch (CPLD GPIO 176): level 1 = no card */
+qemu_irq dream_input_sd_detect(void);
+
 #endif
